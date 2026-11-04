@@ -31,12 +31,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `rho_yn = rho (1 - Y_e)`, filled by `load_bs05`.
 - **`solar.adiabaticity`**: the smallest adiabaticity parameter on the way out
   of the Sun; `production_mixing` warns below 10 unless `check_adiabaticity=False`.
+- **`layers.propagate_layers_pdg`**: `propagate_layers` for standard 3-flavor
+  `OscParams` in the reduced real basis (theta23/delta factored out, so every
+  layer is `exp(-iH'L)` of a real symmetric `H'`), with an optional static
+  `mirror=(start, n_half)` declaring a mirror-symmetric block of segments (an
+  Earth chord from a surface detector) that is then propagated once and
+  transposed.  Same operator to floating-point precision
+  (`tests/test_reduced_basis.py`).
+- **`nufast.event_probability`**: per-event `P(flavor_from[i] -> flavor_to[i])`
+  at constant density in one elementwise pass (per-event channel select and
+  optional per-event nu/nubar sign, no `(N, 3, 3)` intermediate or gather) --
+  the event-sample counterpart of `probability_constant(...)[i, to, from]`.
 
 ### Changed
 
 - **Sterile results from `load_bs05` profiles change**: with `rho_yn`, sterile
   flavors feel the neutral-current term in `adiabatic_mass_fractions`.
   `profile._replace(rho_yn=None)` gives the previous behaviour.
+- **Faster matrix-exponential / layered propagation** (same results to
+  floating-point precision).  `probability_earth`, `probability_profile` and
+  `probability_constant(backend="cayley")` use the reduced real basis for
+  `OscParams` without NSI, and `probability_earth` the chord's mirror symmetry
+  (PREM `n_sub=4`, 100x100 grid, one CPU core: forward ~15x, gradient ~9x).
+  All paths avoid XLA:CPU's slow batched tiny `dot` and its duplication of
+  transcendentals across fusions (`mango/_small.py`), hoist the vacuum
+  Hamiltonian out of the sequential layer scan, and `jax.checkpoint` the scan
+  steps (faster, lower-memory gradients); `eigvalsh3` works on real invariants
+  and sorts its degenerate fallback with a compare-exchange network.
+- **Faster NuFast** (`nufast.prob_matrix`, same values to floating-point
+  precision): the per-energy `sin`/`cos` are materialised once instead of being
+  duplicated by XLA into every consumer fusion, the energy-independent
+  invariants are split out, and the 3x3 output is stacked along its last axis
+  (1e5 energies, one CPU core: forward ~5x, gradient ~2.4x).
 
 ### Fixed
 

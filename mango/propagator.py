@@ -18,7 +18,8 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 
-from .eigensolve import eigvalsh3
+from ._small import materialize, matmul_small
+from .eigensolve import _eigvalsh3_tuple, eigvalsh3_sym
 
 
 def propagator_eigh(h, length):
@@ -36,7 +37,7 @@ def propagator_eigh(h, length):
     """
     w, v = jnp.linalg.eigh(h)
     phase = jnp.exp(-1j * w * length)
-    return (v * phase) @ jnp.conj(v).T
+    return matmul_small(v * phase, jnp.conj(v).T)
 
 
 def propagator_expm(h, length):
@@ -65,23 +66,50 @@ _DEGEN_EPS = 1e-7
 
 
 def _f(x):
-    return jnp.exp(-1j * x)
+    # exp(-i x) for real x, as (cos x, -sin x): bit-identical to jnp.exp(-1j * x)
+    # without the complex exp's exp(0) of the (zero) real part.
+    return jax.lax.complex(jnp.cos(x), -jnp.sin(x))
 
 
-def _fp(x):
-    return -1j * jnp.exp(-1j * x)
+def _fp(x, fx=None):
+    # f'(x) = -i exp(-i x) = -sin x - i cos x (bit-identical to -1j * _f(x)),
+    # read off a precomputed fx = f(x) when given (no further transcendentals).
+    if fx is None:
+        return jax.lax.complex(-jnp.sin(x), -jnp.cos(x))
+    return jax.lax.complex(jnp.imag(fx), -jnp.real(fx))
 
 
-def _divdiff(a, b):
+def _cdiv(z, d):
+    # complex / real, componentwise (bit-identical to ``z / d`` for real ``d``).
+    return jax.lax.complex(jnp.real(z) / d, jnp.imag(z) / d)
+
+
+def _divdiff(a, b, fa=None, fb=None):
     """First divided difference ``(f(a)-f(b))/(a-b)`` with confluent limit.
 
     Uses a safe denominator so the *unused* branch never feeds NaN into the
     reverse-mode gradient (JAX ``where`` propagates NaNs from both branches).
+    ``fa``/``fb`` optionally pass precomputed ``f(a)``/``f(b)``.
     """
+    fa = _f(a) if fa is None else fa
+    fb = _f(b) if fb is None else fb
     d = a - b
     big = jnp.abs(d) > _DEGEN_EPS
     safe = jnp.where(big, d, 1.0)
-    return jnp.where(big, (_f(a) - _f(b)) / safe, _fp(a))
+    return jnp.where(big, _cdiv(fa - fb, safe), _fp(a, fa))
+
+
+def _newton_coefficients(m0, m1, m2):
+    """``f[m0]``, ``f[m0,m1]``, ``f[m0,m1,m2]`` of ``f(x) = exp(-ix)`` (ascending
+    eigenphases), with the confluent limits; each ``f(m_k)`` computed once."""
+    f0, f1, f2 = materialize((_f(m0), _f(m1), _f(m2)))
+    d01 = _divdiff(m0, m1, f0, f1)
+    d12 = _divdiff(m1, m2, f1, f2)
+    dd = m2 - m0
+    big = jnp.abs(dd) > _DEGEN_EPS
+    safe = jnp.where(big, dd, 1.0)
+    d012 = jnp.where(big, _cdiv(d12 - d01, safe), -0.5 * f0)  # f''(m0)/2
+    return materialize((f0, d01, d012))
 
 
 def propagator_cayley(h, length):
@@ -96,22 +124,85 @@ def propagator_cayley(h, length):
     is exact for repeated eigenvalues, so zero-length segments (degenerate zero
     eigenvalues -> identity) and level crossings are handled without the
     singular Vandermonde solve.
+
+    ``H`` must be Hermitian (only its real diagonal and upper triangle are
+    read).  The product ``(M - m0 I)(M - m1 I)`` of two commuting Hermitian
+    matrices is Hermitian, so it is formed entrywise from its diagonal and upper
+    triangle (no batched ``dot``, see :mod:`mango._small`); the shared
+    intermediates are materialized once.
     """
     m = h * length  # Hermitian, eigenvalues O(1)
-    mu = eigvalsh3(m)  # real, ascending, shape (3,)
-    m0, m1, m2 = mu[0], mu[1], mu[2]
+    if not jnp.iscomplexobj(m):
+        s = propagator_cayley_sym(m[0, 0], m[1, 1], m[2, 2],
+                                  m[0, 1], m[0, 2], m[1, 2])
+        return _sym_to_matrix(s)
+    m0, m1, m2 = _eigvalsh3_tuple(m)  # real, ascending
+    f0, d01, d012 = _newton_coefficients(m0, m1, m2)
 
-    d01 = _divdiff(m0, m1)
-    d12 = _divdiff(m1, m2)
-    dd = m2 - m0
-    big = jnp.abs(dd) > _DEGEN_EPS
-    safe = jnp.where(big, dd, 1.0)
-    d012 = jnp.where(big, (d12 - d01) / safe, -0.5 * _f(m0))  # f''(m0)/2
+    re = jnp.real(m)
+    x, y, z = m[0, 1], m[0, 2], m[1, 2]
+    xx = jnp.real(x) ** 2 + jnp.imag(x) ** 2
+    yy = jnp.real(y) ** 2 + jnp.imag(y) ** 2
+    zz = jnp.real(z) ** 2 + jnp.imag(z) ** 2
+    # A = M - m0 I, B = M - m1 I (real diagonals; off-diagonals x, y, z of M).
+    a0, a1, a2 = re[0, 0] - m0, re[1, 1] - m0, re[2, 2] - m0
+    b0, b1, b2 = re[0, 0] - m1, re[1, 1] - m1, re[2, 2] - m1
+    ab00 = a0 * b0 + xx + yy
+    ab11 = xx + a1 * b1 + zz
+    ab22 = yy + zz + a2 * b2
+    ab01 = (a0 + b1) * x + y * jnp.conj(z)
+    ab02 = (a0 + b2) * y + x * z
+    ab12 = jnp.conj(x) * y + (a1 + b2) * z
+    s00 = f0 + d01 * a0 + d012 * ab00
+    s11 = f0 + d01 * a1 + d012 * ab11
+    s22 = f0 + d01 * a2 + d012 * ab22
+    s01 = d01 * x + d012 * ab01
+    s02 = d01 * y + d012 * ab02
+    s12 = d01 * z + d012 * ab12
+    s10 = d01 * jnp.conj(x) + d012 * jnp.conj(ab01)
+    s20 = d01 * jnp.conj(y) + d012 * jnp.conj(ab02)
+    s21 = d01 * jnp.conj(z) + d012 * jnp.conj(ab12)
+    return materialize(jnp.stack([jnp.stack([s00, s01, s02]),
+                                  jnp.stack([s10, s11, s12]),
+                                  jnp.stack([s20, s21, s22])]))
 
-    eye = jnp.eye(3, dtype=jnp.complex128)
-    a = m - m0 * eye
-    b = m - m1 * eye
-    return _f(m0) * eye + d01 * a + d012 * (a @ b)
+
+def propagator_cayley_sym(m00, m11, m22, m01, m02, m12):
+    """``exp(-i M)`` for a *real symmetric* dimensionless 3x3 ``M`` (= H L).
+
+    Same Newton/Cayley-Hamilton construction and degeneracy guards as
+    :func:`propagator_cayley`, specialised to real input: the matrix polynomial
+    is real and only the three scalar coefficients are complex, and the result
+    is complex *symmetric* (``exp(-iM)^T = exp(-iM^T)``).  Takes and returns the
+    six independent entries ``(00, 11, 22, 01, 02, 12)`` as separate
+    (elementwise-batched) arrays; this is the per-layer kernel of the
+    reduced-basis fast path in :mod:`mango.layers`.
+    """
+    m0, m1, m2 = eigvalsh3_sym(m00, m11, m22, m01, m02, m12)
+    f0, d01, d012 = _newton_coefficients(m0, m1, m2)
+    a0, a1, a2 = m00 - m0, m11 - m0, m22 - m0
+    b0, b1, b2 = m00 - m1, m11 - m1, m22 - m1
+    # (M - m0 I)(M - m1 I): product of commuting symmetric matrices, symmetric.
+    ab00 = a0 * b0 + m01 * m01 + m02 * m02
+    ab11 = m01 * m01 + a1 * b1 + m12 * m12
+    ab22 = m02 * m02 + m12 * m12 + a2 * b2
+    ab01 = (a0 + b1) * m01 + m02 * m12
+    ab02 = (a0 + b2) * m02 + m01 * m12
+    ab12 = m01 * m02 + (a1 + b2) * m12
+    return materialize((f0 + d01 * a0 + d012 * ab00,
+                        f0 + d01 * a1 + d012 * ab11,
+                        f0 + d01 * a2 + d012 * ab22,
+                        d01 * m01 + d012 * ab01,
+                        d01 * m02 + d012 * ab02,
+                        d01 * m12 + d012 * ab12))
+
+
+def _sym_to_matrix(s):
+    """``(00, 11, 22, 01, 02, 12)`` entries -> symmetric ``(..., 3, 3)`` matrix."""
+    s00, s11, s22, s01, s02, s12 = s
+    return jnp.stack([jnp.stack([s00, s01, s02], -1),
+                      jnp.stack([s01, s11, s12], -1),
+                      jnp.stack([s02, s12, s22], -1)], -2)
 
 
 _BACKENDS = {

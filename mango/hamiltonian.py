@@ -15,7 +15,10 @@ the electron flavor.  Antineutrinos use ``U -> U*`` and ``V -> -V``.
 
 from __future__ import annotations
 
+import numpy as np
 import jax.numpy as jnp
+
+from ._small import matmul_small
 
 
 def vacuum_hamiltonian(u, msq, energy_eV):
@@ -23,7 +26,7 @@ def vacuum_hamiltonian(u, msq, energy_eV):
     u = jnp.asarray(u, dtype=jnp.complex128)
     msq = jnp.asarray(msq)
     kin = msq / (2.0 * energy_eV)
-    return (u * kin) @ jnp.conj(u).T
+    return matmul_small(u * kin, jnp.conj(u).T)
 
 
 def matter_hamiltonian(u, msq, energy_eV, v_eV, anti=False, nsi=None,
@@ -79,12 +82,20 @@ def matter_term(n, v_cc, v_nc=0.0, nsi=None, n_active=None):
     """
     if n_active is None:
         n_active = n
-    matter = jnp.zeros((n, n), dtype=jnp.complex128)
-    matter = matter.at[0, 0].add(v_cc)
+    # Built as potentials times constant 0/1 masks rather than with ``.at[]``
+    # scatters: the same values (``x * 1 = x``; the ``x * 0`` entries are zeros
+    # that add exactly), but plain elementwise ops that fuse into the caller's
+    # per-layer loop instead of a (batched) scatter per segment.
+    pe = np.zeros((n, n))
+    pe[0, 0] = 1.0
+    matter = (jnp.asarray(v_cc) * pe).astype(jnp.complex128)
     if nsi is not None:
-        na = jnp.asarray(nsi).shape[0]
-        matter = matter.at[:na, :na].add(v_cc * jnp.asarray(nsi, jnp.complex128))
+        nsi = jnp.asarray(nsi, jnp.complex128)
+        na = nsi.shape[0]
+        if na < n:
+            nsi = jnp.zeros((n, n), jnp.complex128).at[:na, :na].set(nsi)
+        matter = matter + v_cc * nsi
     if n_active < n:
-        diag_nc = jnp.where(jnp.arange(n) >= n_active, v_nc, 0.0)
-        matter = matter + jnp.diag(diag_nc.astype(jnp.complex128))
+        ps = np.diag((np.arange(n) >= n_active).astype(float))
+        matter = matter + (jnp.asarray(v_nc) * ps).astype(jnp.complex128)
     return matter

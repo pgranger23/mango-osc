@@ -110,6 +110,22 @@ support is experimental). *Implemented.*
 - `jax_enable_x64` set on import (Δm² ~ 1e−3 eV² + phase accuracy need float64).
 - `jit` the probability fn; `vmap` over grids; `lax.scan` for the layer product.
 - 3×3 analytic kernels avoid generic LAPACK overhead for batched small matrices.
+- XLA:CPU specifics (`mango/_small.py`): tiny batched `dot`/`einsum` is ~10×
+  slower than the same contraction as fused multiply-adds, and fusion
+  *duplicates* shared producers (transcendentals included) into every consumer,
+  so the kernels are written entrywise and their fan-out points
+  (eigenvalues, `exp(−iμ)`, `S` entries) pinned with an `optimization_barrier`
+  (CPU only). The layer scans are `jax.checkpoint`-ed (reverse mode recomputes a
+  layer instead of storing its intermediates).
+- **Reduced real basis** (`layers.propagate_layers_pdg`, used automatically by
+  `probability_earth` / `probability_profile` / `probability_constant(backend=
+  "cayley")` for `OscParams` without NSI): `U = (R₂₃D)(R₁₃R₁₂)D†`, and `R₂₃D`
+  commutes with `diag(V,0,0)`, so each layer is `exp(−iH′L)` of a *real
+  symmetric* `H′`; `exp(−iH′L)` is complex symmetric, so a chord's ascending
+  leg is the transpose of its descending one and only half the shells are
+  propagated (surface detector: the surface shell's rounding-level length
+  difference between the legs is applied exactly to first order). The vacuum
+  (atmospheric) leg is applied in closed form.
 
 ## 8. Public API
 
@@ -142,16 +158,13 @@ g = jax.grad(lambda p: mango.prob_earth(p, E, cz, MU, E_).sum())(params)
 ## 11. Roadmap (later)
 
 **GPU-oriented NuFast-Earth propagator.** The constant-density `nufast` backend
-reached parity with NuFast's C++; the Earth path did not, and a cost decomposition
-showed the CPU gap is XLA per-op overhead on the sequential scan of tiny 3×3 ops —
-not algorithmic — so restructuring buys ≤1.15× on CPU. NuFast-Earth's optimizations
-(eigensystem caching across `cosθz`; reduced-basis **real** per-shell amplitudes
-factoring θ₂₃/δ out — reuses the Rosetta code in `mango.nufast`; symmetric-trajectory
-halving; path-mean density) compound with the existing `vmap` structure and amortize
-the overhead **on GPU/TPU**. Trigger: a GPU target. Start with the reduced-basis
-real amplitude (highest flop saving, reuses existing code). Until then: for fast CPU
-Earth probabilities, call NuFast-Earth directly; jaxnu's Earth value is
-differentiability + validated physics.
+reached parity with NuFast's C++. For the Earth path, the reduced-basis **real**
+per-shell propagators (θ₂₃/δ factored out) and symmetric-trajectory halving are
+now implemented (§7), together with the XLA:CPU fixes for tiny matmuls and fusion
+duplication (`probability_earth`, PREM `n_sub=4`, one CPU core: ~15× forward,
+~9× gradient).
+Remaining NuFast-Earth ideas: eigensystem caching across `cosθz`; path-mean
+density.
 
 **Supernova module** — the natural consumer of the diffrax (stiff/implicit)
 backend; non-adiabatic / collective oscillations.

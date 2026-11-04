@@ -24,6 +24,9 @@ from . import nufast as _nufast
 from .hamiltonian import matter_hamiltonian
 from .layers import propagate_layers
 from .propagator import propagator
+from . import layers as _layers
+from ._small import matmul_small
+from .params import OscParams
 
 
 class Flavor(enum.IntEnum):
@@ -34,7 +37,11 @@ class Flavor(enum.IntEnum):
 
 def prob_from_amplitude(s):
     """``P[beta, alpha] = |S[beta, alpha]|^2`` for evolution operator ``s``."""
-    return jnp.abs(s) ** 2
+    # re^2 + im^2: no hypot/sqrt (``jnp.abs``) followed by a square.
+    s = jnp.asarray(s)
+    if not jnp.iscomplexobj(s):
+        return s * s
+    return jnp.real(s) ** 2 + jnp.imag(s) ** 2
 
 
 def select(p, flavor_in, flavor_out):
@@ -169,6 +176,58 @@ def _nsi_matrix(nsi, n_active):
     return jnp.asarray(nsi, dtype=jnp.complex128)
 
 
+def _use_pdg_path(params, nsi_mat, backend):
+    """Static choice of the reduced-basis fast path
+    (:func:`mango.layers.propagate_layers_pdg`): standard 3-flavor PDG
+    parameters (exactly :class:`mango.OscParams`, whose ``pmns()`` is the PDG
+    matrix the factorization assumes), no NSI, ``cayley`` backend.  Everything
+    else takes the general :func:`mango.layers.propagate_layers` route."""
+    return backend == "cayley" and nsi_mat is None and type(params) is OscParams
+
+
+# Shells whose outer radius is below the detector radius by more than this are
+# crossed with bit-identical length and density by the two legs of the chord
+# (their path ends ``d_out < |s_det|`` are never clamped -- the margin dwarfs the
+# ~1e-8 km^2 rounding of ``r^2 - r_min^2``); see `_earth_mirror`.
+_MIRROR_MARGIN_KM = 1e-6
+
+
+def _earth_mirror(outer, det_depth_km, r_surface=None):
+    """Static ``mirror=(start, n_half)`` (see :func:`mango.layers.
+    propagate_layers_pdg`) for the Earth part ``[1:]`` of a ``chord_segments`` /
+    ``layered_chord_segments`` list (``n`` descending then ``n`` ascending
+    crossings, after the atmospheric segment 0), or ``None`` if it cannot be
+    established from static information.
+
+    Shells entirely below the detector are crossed identically by the two legs
+    and form the mirrored block.  With the detector at the surface that is every
+    shell but the outermost, whose two crossings differ only by rounding (the
+    ascending one is clamped at the detector): it joins the block, the
+    rounding-level length difference being applied exactly by the block's edge
+    correction, so ``mirror = (0, n)``.  For a detector below the surface the
+    ``j`` shells reaching up to (or above) its radius stay explicit on both
+    legs, ``mirror = (j, n - j)``.
+
+    ``outer``: ascending shell outer radii, concrete (numpy) or traced; for
+    traced radii (``LayeredEarth`` under ``grad``) only ``det_depth_km == 0`` is
+    handled, assuming strictly ascending radii as documented for
+    :class:`mango.earth.LayeredEarth` (a degenerate, zero-thickness outer shell
+    would only shift the result at the rounding level of the chord geometry).
+    """
+    if not (_is_concrete(det_depth_km) and _np.ndim(det_depth_km) == 0):
+        return None
+    depth = float(det_depth_km)
+    n = int(_np.shape(outer)[0])
+    if not _is_concrete(outer):
+        return (0, n) if depth == 0.0 else None
+    outer = _np.asarray(outer, dtype=float)
+    r_det = (outer[-1] if r_surface is None else r_surface) - depth
+    j = int(_np.sum(outer > r_det - _MIRROR_MARGIN_KM))  # shells at/above r_det
+    if depth == 0.0 and j == 1:
+        return (0, n)
+    return (j, n - j) if j < n else None
+
+
 # --- public API --------------------------------------------------------------
 
 def probability_constant(params, energy_GeV, baseline_km, density=0.0, ye=0.5,
@@ -213,10 +272,17 @@ def probability_constant(params, energy_GeV, baseline_km, density=0.0, ye=0.5,
     nsi_mat = _nsi_matrix(nsi, na)
     backend = _resolve_backend(params, backend)
 
-    def core(e_eV):
-        h = matter_hamiltonian(u, msq, e_eV, v_cc, anti=anti, nsi=nsi_mat,
-                               v_nc_eV=v_nc, n_active=na)
-        return prob_from_amplitude(propagator(h, length_invEV, backend=backend))
+    if _use_pdg_path(params, nsi_mat, backend):
+        # Reduced real basis (see mango.layers): one real-symmetric layer.
+        def core(e_eV):
+            return prob_from_amplitude(_layers._constant_pdg(
+                params, e_eV, v_cc, length_invEV, anti=anti))
+    else:
+        def core(e_eV):
+            h = matter_hamiltonian(u, msq, e_eV, v_cc, anti=anti, nsi=nsi_mat,
+                                   v_nc_eV=v_nc, n_active=na)
+            return prob_from_amplitude(propagator(h, length_invEV,
+                                                  backend=backend))
 
     p = core(energy_eV) if energy_eV.ndim == 0 else jax.vmap(core)(energy_eV)
     if flavor_in is not None and flavor_out is not None:
@@ -242,6 +308,8 @@ def probability_profile(params, energy_GeV, density_gcc, ye, length_km,
     segment, ordered source -> detector).  ``energy_GeV`` is a scalar or array.
     With ``mass_states=True`` the initial index is a vacuum mass eigenstate,
     ``P[..., beta, i] = P(nu_i -> nu_beta)`` (see :func:`probability_earth`).
+    Standard :class:`mango.OscParams` without ``nsi`` (``cayley`` backend) use
+    the faster reduced real basis, :func:`mango.layers.propagate_layers_pdg`.
     """
     _check_positive(energy_GeV, "energy_GeV", "GeV, not eV")
     _check_nonneg(density_gcc, "density_gcc", "g/cm^3")
@@ -259,10 +327,18 @@ def probability_profile(params, energy_GeV, density_gcc, ye, length_km,
     nsi_mat = _nsi_matrix(nsi, na)
     backend = _resolve_backend(params, backend)
 
-    def core(e_eV):
-        s = propagate_layers(u, msq, e_eV, v_cc, length_invEV, anti=anti,
-                             backend=backend, nsi=nsi_mat, v_nc=v_nc, n_active=na)
-        return prob_from_amplitude(s @ u_in if mass_states else s)
+    if _use_pdg_path(params, nsi_mat, backend):
+        def core(e_eV):  # reduced-basis fast path (same probabilities)
+            return prob_from_amplitude(_layers._propagate_pdg(
+                params, e_eV, v_cc, length_invEV, anti=anti,
+                mass_states=mass_states))
+    else:
+        def core(e_eV):
+            s = propagate_layers(u, msq, e_eV, v_cc, length_invEV, anti=anti,
+                                 backend=backend, nsi=nsi_mat, v_nc=v_nc,
+                                 n_active=na)
+            return prob_from_amplitude(matmul_small(s, u_in) if mass_states
+                                       else s)
 
     energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
     p = core(energy_eV) if energy_eV.ndim == 0 else jax.vmap(core)(energy_eV)
@@ -317,6 +393,14 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
     parametric constant-density-shell Earth instead of the fixed PREM polynomials;
     probabilities are then differentiable w.r.t. the **shell boundary radii**,
     **densities** and **Y_e** (it overrides ``n_sub`` / ``ye_core`` / ``ye_mantle``).
+
+    Standard :class:`mango.OscParams` without ``nsi`` and with the default
+    ``cayley`` backend run in the reduced real basis of
+    :func:`mango.layers.propagate_layers_pdg`, using the chord's mirror symmetry
+    (shells below the detector are crossed identically on the way down and up;
+    a static, concrete ``det_depth_km`` is needed to exploit it) -- the same
+    probabilities and derivatives as the general path to floating-point
+    precision, several times faster.
     """
     _check_positive(energy_GeV, "energy_GeV", "GeV, not eV")
     _check_abs_le_one(cos_zenith, "cos_zenith")
@@ -334,17 +418,37 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
         segments = lambda cz: _earth.chord_segments(
             cz, table, h_atm_km=h_atm_km, det_depth_km=det_depth_km,
             ye_core=ye_core, ye_mantle=ye_mantle)
+        mirror_outer = table.outer
     else:
         segments = lambda cz: _earth.layered_chord_segments(
             earth_model, cz, h_atm_km=h_atm_km, det_depth_km=det_depth_km)
+        mirror_outer = earth_model.outer
 
-    def core(e_eV, cz):
-        rho, ye, length_km = segments(cz)
-        v_cc, v_nc = C.matter_potentials(rho, ye)
-        length_invEV = length_km * C.KM_TO_INV_EV
-        s = propagate_layers(u, msq, e_eV, v_cc, length_invEV, anti=anti,
-                             backend=backend, nsi=nsi_mat, v_nc=v_nc, n_active=na)
-        return prob_from_amplitude(s @ u_in if mass_states else s)
+    if _use_pdg_path(params, nsi_mat, backend):
+        # Reduced-basis fast path (mango.layers.propagate_layers_pdg), with the
+        # chord's mirror symmetry: shells below the detector are crossed
+        # identically on the way down and up, so only one leg is propagated.
+        mirror = _earth_mirror(mirror_outer, det_depth_km,
+                               C.R_EARTH_KM if earth_model is None else None)
+
+        def core(e_eV, cz):
+            rho, ye, length_km = segments(cz)
+            v_cc = C.matter_potential_eV(rho, ye)
+            s = _layers._propagate_pdg(params, e_eV, v_cc,
+                                       length_km * C.KM_TO_INV_EV, anti=anti,
+                                       mirror=mirror, mass_states=mass_states,
+                                       vacuum_first=True)
+            return prob_from_amplitude(s)
+    else:
+        def core(e_eV, cz):
+            rho, ye, length_km = segments(cz)
+            v_cc, v_nc = C.matter_potentials(rho, ye)
+            length_invEV = length_km * C.KM_TO_INV_EV
+            s = propagate_layers(u, msq, e_eV, v_cc, length_invEV, anti=anti,
+                                 backend=backend, nsi=nsi_mat, v_nc=v_nc,
+                                 n_active=na)
+            return prob_from_amplitude(matmul_small(s, u_in) if mass_states
+                                       else s)
 
     energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
     cz = jnp.asarray(cos_zenith, dtype=jnp.float64)

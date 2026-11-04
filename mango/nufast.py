@@ -34,11 +34,40 @@ Denton), so this port is used under the terms of that license; the original
 authors' copyright is credited here and in this repository's top-level
 ``README.md``. If you use this backend, please also cite Denton & Parke, Phys.
 Rev. D 110, 073005 (2024) [arXiv:2405.02400], as the original authors request.
+
+Performance structure
+---------------------
+The algebra is split into an energy-independent part (:func:`_vacuum_invariants`,
+evaluated once per parameter point) and a purely elementwise per-energy part
+(:func:`_channels`), so it can be evaluated directly on arrays of energies.
+Two things matter for speed under XLA (measured on CPU with jax 0.12):
+
+* XLA treats ``sin``/``cos`` as "cheap" and freely *duplicates* them into every
+  fusion that consumes them -- for the 3x3 output (whose 9 entries are stacked by
+  a concatenate that evaluates its operands once per output element) and,
+  much worse, into each of the many reverse-mode fusions.  A float64 sine
+  costs ~10 ns on CPU, so this duplication (together with the stacking layout,
+  see :func:`prob_matrix`) made the probability matrix ~5x and its gradient
+  ~2.5x slower than necessary (1e5 energies, one core).  The per-energy
+  ``sin``/``cos`` are therefore evaluated through :func:`_sin`/:func:`_cos`,
+  which pin their value (and, under differentiation, the derivative
+  ``cos``/``-sin``) behind an ``optimization_barrier``, i.e. compute each
+  exactly once into a buffer.  The barrier changes no value, only XLA's fusion
+  decisions; gradients, forward mode and higher derivatives are unaffected
+  (custom JVP, not custom VJP).
+* :func:`event_probability` returns only the one channel each event needs
+  (elementwise select), with per-event neutrino/antineutrino sign, so an event
+  sample is weighted in one elementwise pass with no ``(N, 3, 3)``
+  intermediate, gather/scatter or concatenate.
 """
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
+from jax import lax
+
+from . import constants as C
 
 _TWO_PI = 2.0 * jnp.pi
 
@@ -61,11 +90,54 @@ def _safe_sqrt(x):
     return jnp.where(big, jnp.sqrt(jnp.where(big, x, 1.0)), 0.0)
 
 
-def prob_matrix(params, energy_eV, length_invEV, v_cc_eV, anti=False):
-    """``P[beta, alpha] = P(nu_alpha -> nu_beta)`` (3x3) at one energy.
+# --- transcendentals evaluated exactly once ----------------------------------
+#
+# XLA's fusion heuristics consider sin/cos cheap and duplicate them into every
+# consumer fusion instead of storing them; for this kernel that means each
+# per-energy sine was recomputed ~9x in the forward 3x3 matrix and ~10-20x in the
+# reverse pass (where cos, its derivative, lands in a dozen separate fusions).
+# These wrappers pin the value -- and, under differentiation, the value together
+# with its derivative, computed in the same fusion so sin and cos share their
+# argument reduction -- behind an ``optimization_barrier``, so each is
+# materialised once.  Only the *primal* values go through the barrier: the
+# tangent ``c * t`` (and hence the transposed cotangent) stays unbarriered, so XLA
+# keeps fusing the linear part freely (barriers on cotangents measured slower).
+# A custom JVP, not a custom VJP, so forward mode and higher-order derivatives
+# keep working (the rule is itself differentiable).  Values are unchanged.
 
-    Natural units: ``energy_eV`` in eV, ``length_invEV`` in eV^-1, ``v_cc_eV`` the
-    charged-current potential in eV.
+
+@jax.custom_jvp
+def _sin(x):
+    """``sin(x)``, materialised once (see above)."""
+    return lax.optimization_barrier(jnp.sin(x))
+
+
+@_sin.defjvp
+def _sin_jvp(primals, tangents):
+    (x,), (t,) = primals, tangents
+    s, c = lax.optimization_barrier((jnp.sin(x), jnp.cos(x)))
+    return s, c * t
+
+
+@jax.custom_jvp
+def _cos(x):
+    """``cos(x)``, materialised once (see above)."""
+    return lax.optimization_barrier(jnp.cos(x))
+
+
+@_cos.defjvp
+def _cos_jvp(primals, tangents):
+    (x,), (t,) = primals, tangents
+    c, s = lax.optimization_barrier((jnp.cos(x), jnp.sin(x)))
+    return c, -s * t
+
+
+def _vacuum_invariants(params, anti):
+    """Energy-independent ("vacuum") pieces of the NuFast algebra.
+
+    Computed once per parameter point and broadcast into the per-energy part
+    (:func:`_channels`).  ``anti`` (a Python bool) flips the CP phase; the sign
+    of the matter potential is applied per energy in :func:`_channels`.
     """
     s12sq = jnp.sin(params.theta12) ** 2
     s13sq = jnp.sin(params.theta13) ** 2
@@ -75,7 +147,6 @@ def prob_matrix(params, energy_eV, length_invEV, v_cc_eV, anti=False):
     dm31 = params.dm31
     if anti:
         delta = -delta
-        v_cc_eV = -v_cc_eV
 
     c13sq = 1 - s13sq
     Ue2sq_t = c13sq * s12sq
@@ -99,10 +170,38 @@ def prob_matrix(params, energy_eV, length_invEV, v_cc_eV, anti=False):
     See = A_tmp - dm21 * Ue2sq_t - dm31 * Ue3sq_t
     Tmm_tmp = dm21 * dm31
     Tee = Tmm_tmp * (1 - Ue3sq_t - Ue2sq_t)
+    return dict(
+        dm21=dm21, dm31=dm31, A_tmp=A_tmp, See=See, Tee=Tee, Tmm_tmp=Tmm_tmp,
+        Um2sq_t=Um2sq_t, Um3sq_t=Um3sq_t,
+        # energy-independent prefactors of Tmm and Jmatter below, grouped
+        # exactly as the per-energy expressions associate them
+        Tmm_vac=Tmm_tmp * (1 - Um3sq_t - Um2sq_t),
+        Jfac=Jmatter_t * dm21 * dm31 * (dm31 - dm21),
+    )
 
+
+def _channels(inv, energy_eV, length_invEV, v_cc_eV, sign=None):
+    """The 9 probabilities ``P(alpha -> beta)`` in NuFast order
+    ``(Pee, Pem, Pet, Pme, Pmm, Pmt, Pte, Ptm, Ptt)`` (index ``3*alpha + beta``).
+
+    Purely elementwise in ``energy_eV`` (any shape); ``inv`` from
+    :func:`_vacuum_invariants`.  ``sign`` (``None`` or an array of +-1.0
+    broadcastable to ``energy_eV``) flips neutrino -> antineutrino *per energy*:
+    an antineutrino sees ``-V_CC`` and ``-delta``, and ``delta`` enters the
+    energy-dependent part only through the Jarlskog prefactor ``Jfac`` (odd in
+    ``delta``; ``cos(delta)`` is even), so ``sign * Jfac`` with ``inv`` built at
+    ``anti=False`` is the antineutrino prefactor.  Negation is exact, so
+    this matches evaluating with ``anti=True`` invariants.
+    """
+    dm21, dm31 = inv["dm21"], inv["dm31"]
+    See, Tee, Tmm_tmp = inv["See"], inv["Tee"], inv["Tmm_tmp"]
+    Jfac = inv["Jfac"]
     Amatter = 2.0 * energy_eV * v_cc_eV
+    if sign is not None:
+        Amatter = Amatter * sign
+        Jfac = Jfac * sign
     Cc = Amatter * Tee
-    A = A_tmp + Amatter
+    A = inv["A_tmp"] + Amatter
     B = Tmm_tmp + Amatter * See
 
     # lambda3 from the exact cubic, then the other eigenvalue gaps analytically.
@@ -110,7 +209,7 @@ def prob_matrix(params, energy_eV, length_invEV, v_cc_eV, anti=False):
     arg = (A**3 - 4.5 * A * B + 13.5 * Cc) / rootAsqB**3
     ss0 = jnp.arccos(jnp.clip(arg, -1.0, 1.0))
     ss0 = jnp.where(dm31 < 0.0, ss0 + _TWO_PI, ss0)
-    lambda3 = (A + 2.0 * rootAsqB * jnp.cos(ss0 / 3.0)) / 3.0
+    lambda3 = (A + 2.0 * rootAsqB * _cos(ss0 / 3.0)) / 3.0
 
     tmp = A - lambda3
     # Floored so that Dl21 > 0 strictly: see _DL21_FLOOR_REL above.  The
@@ -129,11 +228,11 @@ def prob_matrix(params, energy_eV, length_invEV, v_cc_eV, anti=False):
     # Rosetta: matter mixing magnitudes from eigenvalues + invariants.
     Ue3sq = (lambda3 * (lambda3 - See) + Tee) * Xp3
     Ue2sq = (lambda2 * (lambda2 - See) + Tee) * Xp2
-    Smm = A - dm21 * Um2sq_t - dm31 * Um3sq_t
-    Tmm = Tmm_tmp * (1 - Um3sq_t - Um2sq_t) + Amatter * (See + Smm - A)
+    Smm = A - dm21 * inv["Um2sq_t"] - dm31 * inv["Um3sq_t"]
+    Tmm = inv["Tmm_vac"] + Amatter * (See + Smm - A)
     Um3sq = (lambda3 * (lambda3 - Smm) + Tmm) * Xp3
     Um2sq = (lambda2 * (lambda2 - Smm) + Tmm) * Xp2
-    Jmatter = Jmatter_t * dm21 * dm31 * (dm31 - dm21) * PiInv
+    Jmatter = Jfac * PiInv
 
     Ue1sq = 1 - Ue3sq - Ue2sq
     Um1sq = 1 - Um3sq - Um2sq
@@ -144,9 +243,9 @@ def prob_matrix(params, energy_eV, length_invEV, v_cc_eV, anti=False):
     Lover4E = length_invEV / (4.0 * energy_eV)
     D21 = Dl21 * Lover4E
     D32 = Dl32 * Lover4E
-    sinD21 = jnp.sin(D21)
-    sinD31 = jnp.sin(D32 + D21)
-    sinD32 = jnp.sin(D32)
+    sinD21 = _sin(D21)
+    sinD31 = _sin(D32 + D21)
+    sinD32 = _sin(D32)
     triple = sinD21 * sinD31 * sinD32
     s21 = 2 * sinD21**2
     s31 = 2 * sinD31**2
@@ -165,10 +264,80 @@ def prob_matrix(params, energy_eV, length_invEV, v_cc_eV, anti=False):
     Pte = 1 - Pee - Pme
     Ptm = 1 - Pem - Pmm
     Ptt = 1 - Pet - Pmt
+    return (Pee, Pem, Pet, Pme, Pmm, Pmt, Pte, Ptm, Ptt)
 
-    # NuFast indexes probs[alpha][beta] = P(alpha -> beta); transpose to P[beta, alpha].
-    probs = jnp.array([[Pee, Pem, Pet], [Pme, Pmm, Pmt], [Pte, Ptm, Ptt]])
-    return probs.T
+
+def prob_matrix(params, energy_eV, length_invEV, v_cc_eV, anti=False):
+    """``P[beta, alpha] = P(nu_alpha -> nu_beta)`` (3x3) at one energy.
+
+    Natural units: ``energy_eV`` in eV, ``length_invEV`` in eV^-1, ``v_cc_eV`` the
+    charged-current potential in eV.  An array ``energy_eV`` is evaluated
+    elementwise; a 1-D one gives ``(N, 3, 3)``.
+    """
+    if anti:
+        v_cc_eV = -v_cc_eV
+    Pee, Pem, Pet, Pme, Pmm, Pmt, Pte, Ptm, Ptt = _channels(
+        _vacuum_invariants(params, anti), energy_eV, length_invEV, v_cc_eV)
+    # NuFast indexes probs[alpha][beta] = P(alpha -> beta); stack transposed,
+    # P[..., beta, alpha], with the 3x3 axes last (row-major, the layout every
+    # caller vmaps into).  Stacking along the *last* axis matters: building
+    # the (3, 3, ...) array and transposing it measured ~3x slower on CPU.
+    P = jnp.stack([Pee, Pme, Pte, Pem, Pmm, Ptm, Pet, Pmt, Ptt], axis=-1)
+    P = P.reshape(P.shape[:-1] + (3, 3))
+    if P.ndim > 3:
+        # Historical behaviour for >= 2-D energy arrays: the result used to be
+        # ``jnp.array([[...]]).T``, which also reversed the energy axes.
+        nb = P.ndim - 2
+        P = jnp.transpose(P, tuple(range(nb - 1, -1, -1)) + (nb, nb + 1))
+    return P
+
+
+def event_probability(params, energy_GeV, baseline_km, flavor_from, flavor_to,
+                      density=0.0, ye=0.5, anti=False):
+    """Per-event ``P(nu_{flavor_from[i]} -> nu_{flavor_to[i]})`` at ``energy_GeV[i]``.
+
+    The event-sample counterpart of
+    ``probability_constant(params, E, L, density, ye, anti)[i, flavor_to[i],
+    flavor_from[i]]`` (constant density, standard 3-flavor, same units and
+    conventions; same values to rounding), evaluated in one elementwise pass:
+    only the channel each event needs is selected, nothing of shape
+    ``(N, 3, 3)`` is built, and there is no gather (whose reverse mode is a
+    scatter).  ``flavor_from``/``flavor_to`` are integer arrays with values in
+    ``{0, 1, 2}`` (not checked under tracing; out-of-range codes give an
+    unspecified channel).  ``anti`` is a Python bool (whole sample) or a boolean
+    array broadcastable to ``energy_GeV`` (per event, e.g. a sorted nu/antinu
+    sample in one call).  ``params`` must be :func:`eligible` (3-flavor, no NSI).
+    """
+    # oscillator imports this module, hence the deferred import
+    from .oscillator import _check_nonneg, _check_positive, n_flavors
+
+    _check_positive(energy_GeV, "energy_GeV", "GeV, not eV")
+    _check_nonneg(baseline_km, "baseline_km", "km, not m")
+    _check_nonneg(density, "density", "g/cm^3")
+    n = n_flavors(params)
+    if not eligible(params, None, getattr(params, "n_active", n)):
+        raise ValueError(
+            "nufast.event_probability needs standard 3-flavor params (no "
+            "steriles); use probability_constant with a matrix backend instead"
+        )
+
+    energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
+    length_invEV = jnp.asarray(baseline_km) * C.KM_TO_INV_EV
+    v_cc, _ = C.matter_potentials(density, ye)
+
+    if isinstance(anti, (bool, int)):
+        static_anti, sign = bool(anti), None
+        if static_anti:
+            v_cc = -v_cc
+    else:
+        static_anti = False
+        sign = jnp.where(jnp.asarray(anti), -1.0, 1.0)
+    ch = _channels(_vacuum_invariants(params, static_anti), energy_eV,
+                   length_invEV, v_cc, sign)
+    code = 3 * jnp.asarray(flavor_from, jnp.int32) + jnp.asarray(flavor_to, jnp.int32)
+    shape = jnp.broadcast_shapes(jnp.shape(code), *(jnp.shape(c) for c in ch))
+    return lax.select_n(jnp.broadcast_to(code, shape),
+                        *(jnp.broadcast_to(c, shape) for c in ch))
 
 
 def eligible(params, nsi, n_active):

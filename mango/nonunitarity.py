@@ -56,6 +56,7 @@ import jax.numpy as jnp
 from . import constants as C
 from . import earth as _earth
 from .oscillator import select, _grid_eval
+from ._small import matmul_small
 from .propagator import propagator
 
 
@@ -174,10 +175,11 @@ def _propagate_mass_layers(msq, energy_eV, A, B, v_cc_eV, v_nc_eV, length_invEV,
     length_invEV = jnp.asarray(length_invEV)
 
     if not parallel:
+        @jax.checkpoint  # as in mango.layers (see its _remat_note)
         def step(carry, seg):
             v_k, vnc_k, l_k = seg
             h = h_vac + v_k * A - vnc_k * B
-            return propagator(h, l_k, backend=backend) @ carry, None
+            return matmul_small(propagator(h, l_k, backend=backend), carry), None
 
         s0 = jnp.eye(3, dtype=jnp.complex128)
         s, _ = jax.lax.scan(step, s0, (v_cc_eV, v_nc_eV, length_invEV))
@@ -188,7 +190,7 @@ def _propagate_mass_layers(msq, energy_eV, A, B, v_cc_eV, v_nc_eV, length_invEV,
         return propagator(h, l_k, backend=backend)
 
     s_all = jax.vmap(make_s)(v_cc_eV, v_nc_eV, length_invEV)
-    prods = jax.lax.associative_scan(lambda a, b: jnp.matmul(b, a), s_all)
+    prods = jax.lax.associative_scan(lambda a, b: matmul_small(b, a), s_all)
     return prods[-1]
 
 
