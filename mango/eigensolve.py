@@ -19,16 +19,19 @@ handful of real multiplies instead of a generic complex ``det``, and the same
 core serves the real-symmetric 3x3 of the reduced-basis fast path
 (:func:`eigvalsh3_sym`, see :mod:`mango.layers`).  Every operation is
 elementwise, so under ``vmap`` each entry is a contiguous batch array that XLA
-fuses into a single vectorised loop.
+fuses into a single vectorised loop -- on CPU including the ``arccos`` and the
+``cos`` of the trigonometric solution, which go through the arithmetic
+formulations of :mod:`mango._small` (one ``sincos`` gives both cosines).
 """
 
 from __future__ import annotations
 
 import jax.numpy as jnp
 
-from ._small import materialize
+from ._small import _fast_trig, arccos, materialize, sincos
 
 _EPS = 1e-12
+_SQRT3_2 = 0.8660254037844386  # sqrt(3)/2
 
 
 def _sort3(d0, d1, d2):
@@ -79,11 +82,19 @@ def _eigvalsh3_parts(d0, d1, d2, aa, bb, cc, t):
     # Clamp to the valid arccos domain (degenerate eigenvalues sit at r = +-1).
     r = jnp.clip(r, -1.0 + _EPS, 1.0 - _EPS)
 
-    phi = jnp.arccos(r) / 3.0
-    two_pi_3 = 2.0 * jnp.pi / 3.0
+    phi = arccos(r) / 3.0
+    if _fast_trig(phi):
+        # CPU: one (vectorised) sincos, cos(phi + 2pi/3) = -c/2 - (sqrt3/2) s
+        # (see mango._small; equal to the direct form to ~1 ulp), pinned:
+        # XLA:CPU would otherwise recompute it in each eigenvalue's fusion.
+        s, c = sincos(phi, pinned=True)
+        cos_lo = -0.5 * c - _SQRT3_2 * s
+    else:
+        c = jnp.cos(phi)
+        cos_lo = jnp.cos(phi + 2.0 * jnp.pi / 3.0)
 
-    e_hi = q + 2.0 * p * jnp.cos(phi)
-    e_lo = q + 2.0 * p * jnp.cos(phi + two_pi_3)
+    e_hi = q + 2.0 * p * c
+    e_lo = q + 2.0 * p * cos_lo
     e_mid = 3.0 * q - e_hi - e_lo  # trace conservation
 
     # If the matrix was essentially diagonal, fall back to the sorted diagonal.

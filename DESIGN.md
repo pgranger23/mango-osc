@@ -126,6 +126,22 @@ support is experimental). *Implemented.*
   propagated (surface detector: the surface shell's rounding-level length
   difference between the legs is applied exactly to first order). The vacuum
   (atmospheric) leg is applied in closed form.
+- **Vectorisable transcendentals** (`mango/_small.py`, CPU only): XLA:CPU calls
+  scalar libm for float64 `sin`/`cos`/`atan2` (~10-25 ns each, and the call
+  keeps the surrounding fused loop from vectorising).  `sincos` / `arccos` are
+  fdlibm's algorithms (3-part Cody-Waite reduction, exact for |x| < 1e8;
+  `__kernel_sin`/`__kernel_cos`; `__ieee754_acos`) as plain arithmetic: ~3 ns
+  per sin/cos pair, within ~1 ulp of libm, `jnp` derivative rules (custom
+  JVPs).  Used by the Cayley kernel (one `arccos` and one `sincos` for the
+  eigenvalues, `cos(φ + 2π/3)` from the same pair; three `exp(−iμ)`), the
+  closed-form vacuum leg and NuFast.  GPU numerics are unchanged.
+- **Unreached shells skipped** (`probability_earth`, concrete `cos_zenith`): a
+  chord's segments below its turning point (or, going down, below the
+  detector) are exactly zero and their layers exactly the identity; with the
+  zenith grid known at trace time each chord's chain is cut to the shells it
+  crosses, and the chains are bin-packed into one segmented `lax.scan` (reset
+  to the identity where a chord starts, product read at its end) -- one
+  compiled loop, ~15% of the layer evaluations on a uniform PREM grid.
 
 ## 8. Public API
 

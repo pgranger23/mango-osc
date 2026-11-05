@@ -228,6 +228,63 @@ def _earth_mirror(outer, det_depth_km, r_surface=None):
     return (j, n - j) if j < n else None
 
 
+# A shell is skipped for a chord only if ``outer^2 - r_low^2`` is below minus
+# this margin (km^2), i.e. certainly <= 0 in the traced geometry too (numpy and
+# XLA evaluate it to within ~1e-8 km^2), so its segments are exactly zero.
+_TRIM_MARGIN_KM2 = 1e-6
+
+
+def _earth_trim(outer, cz, det_depth_km, n_half, r_surface=None):
+    """Static per-chord count of innermost shells *not reached* (see
+    :func:`mango.layers._reduced_chain_rows`), or ``None`` if not established
+    from static information.
+
+    ``cz``: concrete 1-D numpy cos zenith; ``outer``: ascending outer radii
+    (concrete, or traced -- then only down-going chords seen from a surface
+    detector are trimmed, to their outermost shell, assuming strictly ascending
+    radii as :func:`_earth_mirror` does); ``n_half``: the mirror block length
+    (``0``: no mirror), which bounds the count.
+
+    Up-going, a chord's lowest point is ``r_min = r_det sin(zenith)``; going
+    down, the detector: shells whose outer radius lies below are crossed by
+    neither leg, and ``chord_segments`` / ``layered_chord_segments`` give both
+    of their segments exactly zero length (``_d`` of a negative argument is 0;
+    clipped ranges coincide).
+    """
+    if not (_is_concrete(det_depth_km) and _np.ndim(det_depth_km) == 0):
+        return None
+    depth = float(det_depth_km)
+    n = int(_np.shape(outer)[0])
+    cap = n_half if n_half else n
+    if not _is_concrete(outer):
+        if depth != 0.0:
+            return None
+        return _np.where(cz >= 0.0, min(n - 1, cap), 0).astype(_np.int64)
+    outer = _np.asarray(outer, dtype=float)
+    r_det = (outer[-1] if r_surface is None else r_surface) - depth
+    s2 = 1.0 - cz ** 2  # as earth._rmin2
+    low2 = _np.where(cz < 0.0, r_det ** 2 * _np.where(s2 >= 0.0, s2, 0.0), r_det ** 2)
+    k = _np.sum(outer[None, :] ** 2 < low2[:, None] - _TRIM_MARGIN_KM2, axis=1)
+    return _np.minimum(k, cap).astype(_np.int64)
+
+
+def _grid_trim(cos_zenith, outer, det_depth_km, mirror, r_surface):
+    """Per-chord trim counts for ``probability_earth``'s packed path, or ``None``
+    to keep the per-point path: a traced (or > 1-D) ``cos_zenith``, nothing
+    established statically, or too little to skip (< 10% of the layers) to pay
+    for the packing."""
+    if not _is_concrete(cos_zenith) or _np.ndim(cos_zenith) > 1:
+        return None
+    cz = _np.asarray(cos_zenith, dtype=_np.float64).reshape(-1)
+    n_half = mirror[1] if mirror is not None else 0
+    trim = _earth_trim(outer, cz, det_depth_km, n_half, r_surface)
+    if trim is None:
+        return None
+    per_chord = n_half if n_half else 2 * int(_np.shape(outer)[0])
+    skipped = trim.sum() * (1 if n_half else 2)
+    return trim if skipped >= 0.1 * per_chord * len(cz) else None
+
+
 # --- public API --------------------------------------------------------------
 
 def probability_constant(params, energy_GeV, baseline_km, density=0.0, ye=0.5,
@@ -400,7 +457,14 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
     (shells below the detector are crossed identically on the way down and up;
     a static, concrete ``det_depth_km`` is needed to exploit it) -- the same
     probabilities and derivatives as the general path to floating-point
-    precision, several times faster.
+    precision, several times faster.  If moreover ``cos_zenith`` is concrete
+    (not traced: a grid fixed at trace time, e.g. closed over by the jitted
+    function, the usual fitting setup) each chord skips the shells it does not
+    reach -- below its turning point, or below the detector going down -- whose
+    segments are exactly zero (on a uniform full-sky PREM grid ~85% of them),
+    with all chords' remaining layers packed into one scan.  Same values to
+    rounding, several times faster again (no derivative w.r.t. ``cos_zenith``
+    in that case: pass it traced for that).
     """
     _check_positive(energy_GeV, "energy_GeV", "GeV, not eV")
     _check_abs_le_one(cos_zenith, "cos_zenith")
@@ -424,12 +488,29 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
             earth_model, cz, h_atm_km=h_atm_km, det_depth_km=det_depth_km)
         mirror_outer = earth_model.outer
 
+    energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
     if _use_pdg_path(params, nsi_mat, backend):
         # Reduced-basis fast path (mango.layers.propagate_layers_pdg), with the
         # chord's mirror symmetry: shells below the detector are crossed
         # identically on the way down and up, so only one leg is propagated.
-        mirror = _earth_mirror(mirror_outer, det_depth_km,
-                               C.R_EARTH_KM if earth_model is None else None)
+        r_surface = C.R_EARTH_KM if earth_model is None else None
+        mirror = _earth_mirror(mirror_outer, det_depth_km, r_surface)
+        trim = _grid_trim(cos_zenith, mirror_outer, det_depth_km, mirror, r_surface)
+        if trim is not None:
+            # Concrete zenith grid: every chord skips the shells it does not
+            # reach, chains packed into one scan (mango.layers.
+            # _reduced_chain_rows) -- the same layer products minus identities.
+            cz_rows = jnp.asarray(_np.asarray(cos_zenith, dtype=_np.float64).reshape(-1))
+            rho, ye, length_km = jax.vmap(segments)(cz_rows)
+            s = _layers._propagate_pdg_rows(
+                params, energy_eV, C.matter_potential_eV(rho, ye),
+                length_km * C.KM_TO_INV_EV, trim, anti=anti, mirror=mirror,
+                mass_states=mass_states, vacuum_first=True)
+            p = prob_from_amplitude(s)
+            p = p[0] if _np.ndim(cos_zenith) == 0 else p
+            if flavor_in is not None and flavor_out is not None:
+                return select(p, flavor_in, flavor_out)
+            return p
 
         def core(e_eV, cz):
             rho, ye, length_km = segments(cz)
@@ -450,7 +531,6 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
             return prob_from_amplitude(matmul_small(s, u_in) if mass_states
                                        else s)
 
-    energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
     cz = jnp.asarray(cos_zenith, dtype=jnp.float64)
     p = _grid_eval(core, energy_eV, cz)
 

@@ -54,7 +54,10 @@ Two things matter for speed under XLA (measured on CPU with jax 0.12):
   ``cos``/``-sin``) behind an ``optimization_barrier``, i.e. compute each
   exactly once into a buffer.  The barrier changes no value, only XLA's fusion
   decisions; gradients, forward mode and higher derivatives are unaffected
-  (custom JVP, not custom VJP).
+  (custom JVP, not custom VJP).  On CPU the ``sin``/``cos`` (and the
+  ``arccos`` of the cubic) themselves come from :mod:`mango._small`, plain-
+  arithmetic fdlibm formulations that XLA vectorises (~3 ns for a sin/cos
+  pair instead of ~25 ns of scalar libm calls; within ~1 ulp of them).
 * :func:`event_probability` returns only the one channel each event needs
   (elementwise select), with per-event neutrino/antineutrino sign, so an event
   sample is weighted in one elementwise pass with no ``(N, 3, 3)``
@@ -68,6 +71,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from . import constants as C
+from ._small import arccos, sincos
 
 _TWO_PI = 2.0 * jnp.pi
 
@@ -98,8 +102,8 @@ def _safe_sqrt(x):
 # reverse pass (where cos, its derivative, lands in a dozen separate fusions).
 # These wrappers pin the value -- and, under differentiation, the value together
 # with its derivative, computed in the same fusion so sin and cos share their
-# argument reduction -- behind an ``optimization_barrier``, so each is
-# materialised once.  Only the *primal* values go through the barrier: the
+# argument reduction (mango._small.sincos, pinned as one buffer) -- behind an
+# ``optimization_barrier``, so each is materialised once.  Only the *primal* values go through the barrier: the
 # tangent ``c * t`` (and hence the transposed cotangent) stays unbarriered, so XLA
 # keeps fusing the linear part freely (barriers on cotangents measured slower).
 # A custom JVP, not a custom VJP, so forward mode and higher-order derivatives
@@ -109,26 +113,26 @@ def _safe_sqrt(x):
 @jax.custom_jvp
 def _sin(x):
     """``sin(x)``, materialised once (see above)."""
-    return lax.optimization_barrier(jnp.sin(x))
+    return lax.optimization_barrier(sincos(x)[0])
 
 
 @_sin.defjvp
 def _sin_jvp(primals, tangents):
     (x,), (t,) = primals, tangents
-    s, c = lax.optimization_barrier((jnp.sin(x), jnp.cos(x)))
+    s, c = sincos(x, pinned=True)
     return s, c * t
 
 
 @jax.custom_jvp
 def _cos(x):
     """``cos(x)``, materialised once (see above)."""
-    return lax.optimization_barrier(jnp.cos(x))
+    return lax.optimization_barrier(sincos(x)[1])
 
 
 @_cos.defjvp
 def _cos_jvp(primals, tangents):
     (x,), (t,) = primals, tangents
-    c, s = lax.optimization_barrier((jnp.cos(x), jnp.sin(x)))
+    s, c = sincos(x, pinned=True)
     return c, -s * t
 
 
@@ -207,7 +211,7 @@ def _channels(inv, energy_eV, length_invEV, v_cc_eV, sign=None):
     # lambda3 from the exact cubic, then the other eigenvalue gaps analytically.
     rootAsqB = jnp.sqrt(A * A - 3.0 * B)
     arg = (A**3 - 4.5 * A * B + 13.5 * Cc) / rootAsqB**3
-    ss0 = jnp.arccos(jnp.clip(arg, -1.0, 1.0))
+    ss0 = arccos(jnp.clip(arg, -1.0, 1.0))
     ss0 = jnp.where(dm31 < 0.0, ss0 + _TWO_PI, ss0)
     lambda3 = (A + 2.0 * rootAsqB * _cos(ss0 / 3.0)) / 3.0
 

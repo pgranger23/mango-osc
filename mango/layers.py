@@ -38,10 +38,11 @@ from __future__ import annotations
 
 import operator
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 
-from ._small import matmul_small
+from ._small import materialize, matmul_small, sincos
 from .hamiltonian import vacuum_hamiltonian, matter_term
 from .pmns import pmns_3flavor_factors
 from .propagator import propagator, propagator_cayley_sym
@@ -154,6 +155,12 @@ def _gram_t(r):
     return (dot(0, 0), dot(1, 1), dot(2, 2), dot(0, 1), dot(0, 2), dot(1, 2))
 
 
+def _identity(shape):
+    one = jnp.ones(shape, jnp.complex128)
+    zero = jnp.zeros(shape, jnp.complex128)
+    return ((one, zero, zero), (zero, one, zero), (zero, zero, one))
+
+
 def _tuple_to_matrix(c):
     return jnp.stack([jnp.stack(row, -1) for row in c], -2)
 
@@ -255,8 +262,8 @@ def _reduced_chain(hv, v, length, mirror=None, parallel=False):
 def _vacuum_sym(o, kin, length):
     """Reduced-basis vacuum propagator ``O diag(exp(-i kin L)) O^T`` (symmetric
     6-tuple), exact: the vacuum eigenvalues are ``kin = msq / 2E`` themselves."""
-    ph = jax.lax.complex(jnp.cos(kin * length), -jnp.sin(kin * length))
-    op = o * ph
+    sn, cs = sincos(kin * length)
+    op = o * materialize(jax.lax.complex(cs, -sn))
 
     def e(i, j):
         return op[i, 0] * o[j, 0] + op[i, 1] * o[j, 1] + op[i, 2] * o[j, 2]
@@ -298,13 +305,20 @@ def _propagate_pdg(params, energy_eV, v_eV, length_invEV, anti=False,
     v = jnp.asarray(v_eV)
     v = -v if anti else v
     length = jnp.asarray(length_invEV)
+    l_vac = None
     if vacuum_first:
         v, l_vac, length = v[1:], length[0], length[1:]
     sp = _reduced_chain(hv, v, length, mirror=mirror, parallel=parallel)
+    return _finish_pdg(w, o, kin, sp, l_vac, mass_states)
+
+
+def _finish_pdg(w, o, kin, sp, l_vac, mass_states):
+    """``W S' W^dagger`` (with the closed-form vacuum leg ``l_vac`` applied first
+    unless ``None``) or ``W S' O`` for ``mass_states``; one point."""
     ws = matmul_small(w, sp)
     if mass_states:
         return matmul_small(ws, o.astype(jnp.complex128))
-    if vacuum_first:
+    if l_vac is not None:
         ws = matmul_small(ws, _tuple_to_matrix(_sym_full(_vacuum_sym(o, kin, l_vac))))
     return matmul_small(ws, jnp.conj(w).T)
 
@@ -319,7 +333,7 @@ def _constant_pdg(params, energy_eV, v_eV, length_invEV, anti=False):
 
 
 def propagate_layers_pdg(params, energy_eV, v_eV, length_invEV, anti=False,
-                         mirror=None, parallel=None):
+                         mirror=None, parallel=None, mass_states=False):
     """:func:`propagate_layers` for standard 3-flavor PDG mixing, in the reduced
     real basis (see module docstring) -- same operator, several times faster.
 
@@ -361,10 +375,220 @@ def propagate_layers_pdg(params, energy_eV, v_eV, length_invEV, anti=False,
         probability_earth` keeps those explicit).
     parallel : bool, optional
         Product strategy, as for :func:`propagate_layers`.
+    mass_states : bool
+        Return the amplitude from the vacuum mass states, ``W S' O`` (see
+        :func:`mango.pmns.pmns_3flavor_factors`; ``W*`` for antineutrinos),
+        instead of the flavor-basis operator.  It equals ``S U`` (``S U*``)
+        up to the phase ``exp(-+i delta)`` of its third column (``U = W O
+        D^dagger``), and saves the final product with ``W^dagger`` plus the
+        caller's product with ``U``: ``|.|^2`` is ``P(nu_i -> nu_beta)``, and in
+        interference sums the phase cancels against ``W O`` used in place of
+        ``U`` (e.g. ``sum_k A_bk conj(U'_ak)`` with ``A = W S' O``, ``U' = W
+        O``, is ``S_ba``).
 
     Returns the ``(3, 3)`` flavor-basis evolution operator, equal to
     ``propagate_layers(params.pmns(), params.msquared(), energy_eV, v_eV,
-    length_invEV, anti=anti)`` to floating-point precision.
+    length_invEV, anti=anti)`` to floating-point precision (or, with
+    ``mass_states``, ``W S' O`` as above).
     """
     return _propagate_pdg(params, energy_eV, v_eV, length_invEV, anti=anti,
-                          mirror=mirror, parallel=parallel)
+                          mirror=mirror, parallel=parallel,
+                          mass_states=mass_states)
+
+
+# --- many chords at once: unreached shells skipped, chains packed ------------
+#
+# On an (energy, zenith) grid most chords reach only the outer shells: shells
+# below the turning point r_min = r_det sin(zenith) (and, going down, everything
+# below the detector) get *exactly* zero length -- ``chord_segments`` clamps
+# them -- and their layer is exactly the identity (zero M: degenerate guards,
+# S = 1 entrywise, and multiplying by it is exact).  On a uniform full-sky grid
+# with PREM n_sub=4 that is ~85% of all layer evaluations.  Skipping them for a
+# *concrete* zenith grid (known at trace time) gives every chord its own chain
+# length, which a single ``lax.scan`` (one shape for the whole batch) cannot
+# express directly; the chains are therefore *packed*: each "virtual row" of
+# the scan runs several chords' chains one after the other, the running product
+# being reset to the identity where a new chain starts (a segmented scan), and
+# each chain's product is read off at its last slot.  One scan, as before (no
+# extra compile time), over ~total work / max length virtual rows; the per-chord
+# product is the same sequence of layer products as before, minus identities.
+
+
+def _times(a, b):
+    """``A @ B`` for general 3x3 tuples (entrywise, accumulated as matmul_small)."""
+    return tuple(tuple(a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j]
+                       for j in range(3)) for i in range(3))
+
+
+def _pack(lengths):
+    """Best-fit-decreasing packing of chain lengths into bins of capacity
+    ``max(lengths)``.  Returns ``(capacity, n_bins, place)`` with ``place[j] =
+    (bin, first slot)`` (``(-1, -1)`` for empty chains).  Static (numpy)."""
+    lengths = np.asarray(lengths, dtype=np.int64)
+    cap = max(int(lengths.max(initial=0)), 1)
+    by_room = [[] for _ in range(cap + 1)]  # remaining room -> bin ids
+    fill = []
+    place = np.full((len(lengths), 2), -1, dtype=np.int64)
+    for j in np.argsort(-lengths, kind="stable"):
+        n = int(lengths[j])
+        if n == 0:
+            continue
+        for room in range(n, cap + 1):
+            if by_room[room]:
+                b = by_room[room].pop()
+                break
+        else:
+            b, room = len(fill), cap
+            fill.append(0)
+        place[j] = (b, fill[b])
+        fill[b] += n
+        by_room[room - n].append(b)
+    return cap, len(fill), place
+
+
+def _packed_products(hv, v, length, jobs, parallel):
+    """Products ``S_{k_m} ... S_{k_1}`` of the layer chains ``jobs`` (a list of
+    ``(row, [k_1, ..., k_m])``; segment indices into ``v[row]``,
+    ``length[row]``), packed into one scan (see the section note).
+
+    ``v``, ``length``: ``(n_rows, n_seg)``; ``hv`` entries broadcast against
+    ``(n_rows, 1)`` (e.g. one per energy, shape ``(n_E,)``).  Returns a 3x3
+    tuple of ``(n_jobs,) + batch`` arrays; empty chains give the identity.
+    """
+    n_rows, n_seg = v.shape
+    lengths = np.array([len(k) for _, k in jobs], dtype=np.int64)
+    cap, n_bins, place = _pack(lengths)
+    if n_bins == 0:  # nothing to propagate
+        shape = (len(jobs),) + jnp.broadcast_shapes(jnp.shape(hv[0]), (1, 1))[1:]
+        return _identity(shape)
+    pad = n_rows * n_seg  # index of the appended zero-length padding layer
+    src = np.full((cap, n_bins), pad, dtype=np.int64)
+    reset = np.zeros((cap, n_bins), dtype=bool)
+    end_t = np.zeros(len(jobs), dtype=np.int64)
+    end_b = np.zeros(len(jobs), dtype=np.int64)
+    for j, (row, ks) in enumerate(jobs):
+        if not ks:
+            continue
+        b, t0 = place[j]
+        src[t0:t0 + len(ks), b] = row * n_seg + np.asarray(ks)
+        reset[t0, b] = True
+        end_t[j], end_b[j] = t0 + len(ks) - 1, b
+    zero = jnp.zeros((1,), v.dtype)
+    v_slot = jnp.concatenate([v.reshape(-1), zero])[src][..., None]  # (cap, bins, 1)
+    l_slot = jnp.concatenate([length.reshape(-1), zero.astype(length.dtype)])[src][..., None]
+    flags = jnp.asarray(reset)[..., None]
+    batch = jnp.broadcast_shapes(jnp.shape(hv[0]), (n_bins, 1))
+    if parallel:
+        # segmented parallel prefix: (f, A) . (g, B) = (f | g, g ? B : B A)
+        def comb(a, b):
+            prod = _times(b[1], a[1])
+            return (a[0] | b[0], tuple(tuple(jnp.where(b[0], b[1][i][j], prod[i][j])
+                                             for j in range(3)) for i in range(3)))
+        s_all = _sym_full(_sym_layer(hv, v_slot, l_slot))
+        _, ys = jax.lax.associative_scan(comb, (flags, s_all), axis=0)
+    else:
+        ident = _identity(batch)
+
+        @jax.checkpoint  # see _remat_note
+        def step(carry, seg):
+            v_t, l_t, r_t = seg
+            c = tuple(tuple(jnp.where(r_t, ident[i][j], carry[i][j]) for j in range(3))
+                      for i in range(3))
+            new = _sym_times(_sym_layer(hv, v_t, l_t), c)
+            return new, new
+        _, ys = jax.lax.scan(step, ident, (v_slot, l_slot, flags))
+
+    empty = jnp.asarray(lengths == 0).reshape((-1,) + (1,) * (len(batch) - 1))
+    ident = _identity(())
+    return tuple(tuple(jnp.where(empty, ident[i][j], ys[i][j][end_t, end_b])
+                       for j in range(3)) for i in range(3))
+
+
+def _reduced_chain_rows(hv, v, length, trim, mirror=None, parallel=False):
+    """:func:`_reduced_chain` for many chords at once, skipping their unreached
+    shells (see the section note).
+
+    ``v``, ``length``: ``(n_rows, n_seg)``, each row an Earth chord's segments
+    (``n = n_seg / 2`` shells descending, then the same ascending; no vacuum
+    leg); ``hv`` entries broadcast against ``(n_rows, 1)``.  ``trim`` (static,
+    ``(n_rows,)`` ints): the ``2 trim[i]`` segments around row ``i``'s midpoint
+    (its innermost shells, both legs) have exactly zero length and are not
+    propagated.  ``mirror``: as for :func:`_reduced_chain`, centred on the
+    midpoint (``start + n_half == n``); ``trim[i] <= n_half`` then.  Returns the
+    3x3 tuple of ``(n_rows,) + batch`` arrays.
+    """
+    n_rows, n_seg = v.shape
+    half = n_seg // 2
+    start, n_half = _check_mirror(mirror, n_seg)
+    trim = np.asarray(trim, dtype=np.int64)
+    if n_seg % 2 or trim.shape != (n_rows,) or np.any(trim < 0) or (
+            n_half and (start + n_half != half or np.any(trim > n_half))) or (
+            np.any(trim > half)):
+        raise ValueError("trim/mirror do not describe chords of this shape")
+    rows = range(n_rows)
+    if not n_half:
+        jobs = [(i, list(range(0, half - trim[i])) + list(range(half + trim[i], n_seg)))
+                for i in rows]
+        return _packed_products(hv, v, length, jobs, parallel)
+    rest = start + 2 * n_half
+    jobs = [(i, list(range(start, half - trim[i]))) for i in rows]   # H blocks
+    if start:
+        jobs += [(i, list(range(0, start))) for i in rows]           # prefixes
+    prods = _packed_products(hv, v, length, jobs, parallel)
+    r = tuple(tuple(x[:n_rows] for x in row) for row in prods)
+    ex = (slice(None),) + (None,) * (len(jnp.shape(r[0][0])) - 1)   # (n_rows, 1, ...)
+    edge = _edge_correction(hv, v[:, start][ex],
+                            (length[:, rest - 1] - length[:, start])[ex])
+    gram = _gram_t(r)  # R^T R: mirrored half times the first
+    if start:
+        c = tuple(tuple(x[n_rows:] for x in row) for row in prods)
+        total = _sym_times(edge, _sym_times(gram, c))
+    else:
+        total = _sym_times(edge, _sym_full(gram))
+    if rest < n_seg:  # suffix (detector underground): applied to the total
+        seg = (v[:, rest:].T[(slice(None),) + ex], length[:, rest:].T[(slice(None),) + ex])
+        if parallel:
+            def make_s(v_k, l_k):
+                return _sym_full(_sym_layer(hv, v_k, l_k))
+            s_all = make_s(*seg)
+            suf = jax.lax.associative_scan(lambda a, b: _times(b, a), s_all, axis=0)
+            total = _times(tuple(tuple(x[-1] for x in row) for row in suf), total)
+        else:
+            @jax.checkpoint  # see _remat_note
+            def step(carry, sg):
+                return _sym_times(_sym_layer(hv, *sg), carry), None
+            total, _ = jax.lax.scan(step, total, seg)
+    return total
+
+
+def _propagate_pdg_rows(params, energy_eV, v_eV, length_invEV, trim, anti=False,
+                        mirror=None, parallel=None, mass_states=False,
+                        vacuum_first=False):
+    """:func:`_propagate_pdg` for ``n_rows`` chords (``v_eV``, ``length_invEV``:
+    ``(n_rows, n_seg)``) times energies (scalar or 1-D), skipping each chord's
+    ``trim`` innermost (zero-length) shells (static; see
+    :func:`_reduced_chain_rows`).  Returns ``(n_rows, n_E, 3, 3)`` (``(n_rows,
+    3, 3)`` for a scalar energy) -- the values of ``_propagate_pdg`` per (row,
+    energy).
+    """
+    if parallel is None:
+        parallel = jax.default_backend() != "cpu"
+    e = jnp.asarray(energy_eV)
+    w, o = pmns_3flavor_factors(params.theta12, params.theta13,
+                                params.theta23, params.deltacp)
+    w = jnp.conj(w) if anti else w  # as _pdg_reduced_setup
+    kin, hv = jax.vmap(lambda x: _pdg_reduced_setup(params, x, anti)[2:])(e.reshape(-1))
+    v = jnp.asarray(v_eV)
+    v = -v if anti else v
+    length = jnp.asarray(length_invEV)
+    l_vac = None
+    if vacuum_first:
+        v, l_vac, length = v[:, 1:], length[:, 0], length[:, 1:]
+    sp = _tuple_to_matrix(_reduced_chain_rows(hv, v, length, trim, mirror=mirror,
+                                              parallel=parallel))  # (rows, n_E, 3, 3)
+
+    def row(sp_r, lv):
+        return jax.vmap(lambda s, k: _finish_pdg(w, o, k, s, lv, mass_states))(sp_r, kin)
+    out = (jax.vmap(row)(sp, l_vac) if l_vac is not None
+           else jax.vmap(lambda sp_r: row(sp_r, None))(sp))
+    return out if e.ndim else out[:, 0]

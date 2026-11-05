@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Earth chord from a surface detector) that is then propagated once and
   transposed.  Same operator to floating-point precision
   (`tests/test_reduced_basis.py`).
+- **`propagate_layers_pdg(..., mass_states=True)`**: the reduced-basis
+  amplitude from the vacuum mass states, `W S' O` -- `S U` up to the phase of
+  its third column, which cancels against `W O` used in place of `U` in any
+  interference sum -- saving the products with `W^dagger` and `U`.
 - **`nufast.event_probability`**: per-event `P(flavor_from[i] -> flavor_to[i])`
   at constant density in one elementwise pass (per-event channel select and
   optional per-event nu/nubar sign, no `(N, 3, 3)` intermediate or gather) --
@@ -58,6 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Hamiltonian out of the sequential layer scan, and `jax.checkpoint` the scan
   steps (faster, lower-memory gradients); `eigvalsh3` works on real invariants
   and sorts its degenerate fallback with a compare-exchange network.
+- **Vectorised `sin`/`cos`/`arccos` on CPU** (`mango/_small.py`; same results
+  to ~1 ulp of the libm values, `jnp` derivative rules): XLA:CPU evaluates them
+  as scalar libm calls, now fdlibm's algorithms in plain arithmetic, ~5-9x
+  cheaper.  Used by the Cayley kernel, the closed-form vacuum leg and NuFast
+  (one core: `probability_earth` ~1.8x forward / ~1.4x gradient,
+  `probability_profile` ~2x / ~2x, NuFast ~1.8x / ~1.4x).  GPU unchanged.
+- **`probability_earth` on a concrete zenith grid** (fixed at trace time, e.g.
+  closed over by the jitted function) skips every chord's unreached shells,
+  whose segments are exactly zero, packing the remaining layers of all chords
+  into one scan: same values to rounding, PREM `n_sub=4` 100x100 full-sky grid
+  ~6x forward / ~4.5x gradient faster than before on one core.
 - **Faster NuFast** (`nufast.prob_matrix`, same values to floating-point
   precision): the per-energy `sin`/`cos` are materialised once instead of being
   duplicated by XLA into every consumer fusion, the energy-independent

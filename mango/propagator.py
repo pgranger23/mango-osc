@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 
-from ._small import materialize, matmul_small
+from ._small import materialize, matmul_small, sincos
 from .eigensolve import _eigvalsh3_tuple, eigvalsh3_sym
 
 
@@ -66,16 +66,18 @@ _DEGEN_EPS = 1e-7
 
 
 def _f(x):
-    # exp(-i x) for real x, as (cos x, -sin x): bit-identical to jnp.exp(-1j * x)
-    # without the complex exp's exp(0) of the (zero) real part.
-    return jax.lax.complex(jnp.cos(x), -jnp.sin(x))
+    # exp(-i x) for real x, as (cos x, -sin x) without the complex exp's exp(0)
+    # of the (zero) real part; sin/cos from one vectorisable sincos on CPU
+    # (mango._small; elsewhere jnp.sin/cos: bit-identical to jnp.exp(-1j * x)).
+    s, c = sincos(x)
+    return jax.lax.complex(c, -s)
 
 
 def _fp(x, fx=None):
     # f'(x) = -i exp(-i x) = -sin x - i cos x (bit-identical to -1j * _f(x)),
     # read off a precomputed fx = f(x) when given (no further transcendentals).
     if fx is None:
-        return jax.lax.complex(-jnp.sin(x), -jnp.cos(x))
+        fx = _f(x)
     return jax.lax.complex(jnp.imag(fx), -jnp.real(fx))
 
 
