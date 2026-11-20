@@ -22,9 +22,16 @@ Both parameter sets are differentiable PyTrees, so ``jax.grad`` works through
 recovered exactly; in the fully-decohered limit the interference-averaged
 probability ``sum_i |V_bi|^2 |V_ai|^2`` is obtained.
 
-Scope: vacuum and constant-density matter (a single layer). The damping indices
-refer to the (matter) eigenstates sorted by eigenvalue — in vacuum with normal
-ordering these are the usual mass states 1, 2, 3.
+Scope: vacuum and constant-density matter (a single layer). Through a varying
+profile the state is no longer pure after the first layer and the density
+matrix has to be propagated; that is not implemented yet.
+
+The damping acts between eigenstates of the local matter Hamiltonian, i.e. the
+Lindblad operators commute with H (energy conservation), as in the layered
+treatment of Coloma, Lopez-Pavon, Martinez-Soler & Nunokawa, Eur. Phys. J. C 78
+(2018) 614 [arXiv:1803.04438]. The damping indices refer to the matter
+eigenstates sorted by eigenvalue -- in vacuum with normal ordering these are the
+usual mass states 1, 2, 3; above the MSW resonance they are not.
 """
 
 from __future__ import annotations

@@ -1,13 +1,13 @@
 """Characterization of the continuous (ODE) backend: what it is for, measured.
 
-Not a paper benchmark -- no number here appears in the accompanying paper,
-which does not exercise this backend. It exists because the backend is shipped
-and was otherwise unquantified, and because it documents a usability trap
-(see (b) below) that is easy to walk into.
+The accompanying paper (Sec. III, from v0.3.0) quotes the PREM cross-check (b):
+with a common Y_e the layered product agrees with this backend to 5e-5 at
+n_sub=12 and 2e-6 at n_sub=64. The script also documents a usability trap (see
+(b) below) that is easy to walk into.
 
 The layered path of :mod:`mango.layers` requires the matter profile to be
-piecewise constant. That is exact for PREM, which *is* a shell model, but a
-density given as a smooth function of position -- a supernova profile, a
+piecewise constant. PREM is discretized into constant-density pieces whose
+number is set by ``n_sub``, and a density given as a smooth function of position -- a supernova profile, a
 fitted/continuous Earth model, an analytic solar profile -- has to be
 discretized first, and the discretization error is then set by how many layers
 you are willing to pay for. The ODE backend integrates dS/ds = -i H(s) S
