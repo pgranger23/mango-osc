@@ -5,10 +5,51 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-11-20
+
+### Changed (behaviour)
+
+- **The PREM path now cuts the chord with `segmentation="chord"` by default**
+  (`probability_earth`, standard and non-unitary front-ends; `earth.chord_segments`,
+  `earth.earth_segments`, `earth.critical_cos_zenith`). The default of the
+  front-ends is `segmentation=None`: `"chord"` on the PREM polynomial path, the
+  model's own shells for a `LayeredEarth` (unchanged). Pass
+  `segmentation="radial"` to reproduce v0.2.x numbers exactly. Unchanged:
+  the nadir for a surface detector (the two cuts coincide there), constant
+  density, arbitrary profiles, `LayeredEarth`, and the GLoBES `profiletype=1`
+  import (which keeps the radial cut explicitly). Off-nadir PREM probabilities
+  move by the `n_sub` discretisation error of the radial cut (~1e-3 at
+  `n_sub=4`), towards the continuous-profile limit. A hand-built `ShellTable`
+  whose shells straddle a PREM discontinuity now raises unless
+  `segmentation="radial"` is passed.
 
 ### Added
 
+- **`segmentation="chord"`**. The `"radial"` cut puts a segment boundary at
+  every sub-shell radius, and the chord grazes each of them at some zenith
+  angle: an artificial square-root cusp in `P(cos zenith)`. Their number grows
+  with `n_sub` as their size shrinks, so pointwise `dP/dcos(zenith)` converged
+  only as ~`n_sub^-0.7`. `"chord"` cuts each PREM region's chord interval into
+  the same number of equal-length pieces, which leaves only the physical cusps
+  at real PREM discontinuities; `P` and `dP/dcos(zenith)` then converge as
+  `n_sub^-2` at unchanged cost, and agree with the continuous-profile ODE
+  backend.
+- `earth.resolve_segmentation`, `earth.DEFAULT_SEGMENTATION`.
+- **`benchmarks/fig_nsub_convergence.py`**: convergence in `n_sub` of the
+  tomography-example Fisher outputs and of the zenith-angle derivative for both
+  segmentations, and the tomography example on three Earth paths against one
+  common limit, and the paper's convergence figure (`plot_paper_single` ->
+  `mango_nsub_single`). `demo_tomography_fisher.py` reads `N_SUB`
+  (default 4) and `EARTH_PATH` (default `layered`, the `LayeredEarth`; or
+  `radial` / `chord`, the PREM polynomial path with the same per-zone density
+  scales) from the environment; the defaults reproduce every existing number.
+- **`tests/test_chord_segmentation.py`**.
+- `benchmarks/check_bsm_limits.py`: autodiff vs central finite differences for
+  the Lindblad rates `gamma_ij`, the wave-packet width and the non-unitarity
+  parameters `alpha` (through PREM).
+- `benchmarks/fig_chord_geometry.py` takes the segment boundaries from
+  `earth.chord_segments` itself and draws the continuous PREM density.
+- `benchmarks/*` paper figures regenerated with the chord default.
 - **`mass_states=True`** on `probability_profile` and `probability_earth`: the
   initial index is a vacuum mass eigenstate, `P[..., beta, i] = |(S U)_{beta i}|^2`
   (`U*` for antineutrinos), as solar neutrinos reach the Earth at night. It
@@ -46,6 +87,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`adiabatic_mass_fractions` with decoupled states**: levels in different
   blocks of the Hamiltonian can cross, so eigenstates are now ranked within
   blocks; 3+1 with all `theta_i4 = 0` gives the 3-flavor result.
+
+### Documentation
+
+- `critical_cos_zenith`: only the angles at PREM region boundaries are physical
+  cusps; the sub-shell ones are artefacts of the radial cut.
+
 
 ## [0.2.4] - 2026-08-04
 

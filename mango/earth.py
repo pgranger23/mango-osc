@@ -3,7 +3,12 @@
 Implements the Preliminary Reference Earth Model (Dziewonski & Anderson 1981):
 density as piecewise polynomials in ``x = r / R_earth``.  A neutrino arriving with
 ``cos(zenith) = cz`` (up-going => ``cz < 0``) traverses a chord; we split it into
-constant-density shells and hand the segments to the layer propagator.
+constant-density segments and hand them to the layer propagator.  Within each
+PREM region the chord is cut either into equal-length pieces of the region's
+chord interval (``segmentation="chord"``, the default since v0.3.0, cusp-free in
+``cz`` apart from the real PREM discontinuities) or at radial sub-shell
+boundaries (``segmentation="radial"``, the v0.2.x default); see
+:func:`chord_segments`.
 
 Design choice for ``jit`` / ``vmap``: the shell radii and per-shell densities are
 *static* (built from numpy, independent of ``cz``).  Only the per-segment path
@@ -146,16 +151,102 @@ def _rmin2(r_det, cz):
     return r_det**2 * jnp.where(s2 >= 0.0, s2, 0.0)
 
 
+SEGMENTATIONS = ("radial", "chord")
+DEFAULT_SEGMENTATION = "chord"
+
+
+def _check_segmentation(segmentation):
+    if segmentation not in SEGMENTATIONS:
+        raise ValueError(f"segmentation must be one of {SEGMENTATIONS}, "
+                         f"got {segmentation!r}")
+
+
+def resolve_segmentation(segmentation, earth_model=None):
+    """Resolve the ``segmentation`` argument of the ``probability_earth`` front ends.
+
+    ``None`` (the default) means ``DEFAULT_SEGMENTATION`` (``"chord"``) on the PREM
+    polynomial path and the model's own shells for a :class:`LayeredEarth`, which
+    is piecewise-constant by construction (returned as ``None``).  An explicit
+    ``"radial"`` with a ``LayeredEarth`` is accepted (its shells *are* radial
+    cuts); ``"chord"`` with one raises.
+    """
+    if segmentation is not None:
+        _check_segmentation(segmentation)
+    if earth_model is None:
+        return DEFAULT_SEGMENTATION if segmentation is None else segmentation
+    if segmentation == "chord":
+        raise ValueError("segmentation='chord' applies to the PREM polynomial "
+                         "profile; a LayeredEarth is piecewise-constant by "
+                         "construction, so its shell boundaries are the model")
+    return None
+
+
+def _chord_pieces(table: ShellTable):
+    """Static per-shell bookkeeping for ``segmentation="chord"``.
+
+    For every shell of ``table`` (ascending radius) returns the inner/outer radius
+    of the PREM region that contains it and the shell's fractional position
+    ``[j/m, (j+1)/m]`` among the ``m`` shells of that region.  Raises if a PREM
+    region boundary is not a shell boundary (a hand-built table that straddles a
+    density discontinuity has no well-defined region chord).
+    """
+    inner = np.asarray(table.inner, dtype=float)
+    outer = np.asarray(table.outer, dtype=float)
+    region_hi = np.array([hi for hi, _, _ in _PREM])
+    region_lo = np.concatenate([[0.0], region_hi[:-1]])
+    edges = np.concatenate([inner, outer[-1:]])
+    for b in region_hi:
+        if not np.any(np.isclose(edges, b, rtol=0.0, atol=1e-6)):
+            raise ValueError(f"segmentation='chord' needs every PREM region boundary "
+                             f"to be a shell boundary; {b} km is not")
+    k = np.searchsorted(region_hi, 0.5 * (inner + outer))   # region of each shell
+    m = np.bincount(k, minlength=len(region_hi))[k]
+    j = np.concatenate([np.arange(c) for c in np.bincount(k, minlength=len(region_hi))])
+    return region_lo[k], region_hi[k], j / m, (j + 1) / m
+
+
+def _leg_pieces(rmin2, leg_lo, leg_hi, r_a, r_b, f_lo, f_hi):
+    """Equal-``d`` pieces of each PREM region's chord interval on one leg.
+
+    The region's interval ``[d(r_a), d(r_b)]`` is clamped to the leg
+    ``[leg_lo, leg_hi]`` and split at the static fractions ``f_lo``/``f_hi``.
+    Piece ends are linear in the two clamped region ends, so they move smoothly
+    with ``cz``; a piece can only appear when the chord grazes a PREM region
+    boundary (where the density really is discontinuous).
+    """
+    a = jnp.clip(_d(r_a**2 - rmin2), leg_lo, leg_hi)
+    b = jnp.clip(_d(r_b**2 - rmin2), leg_lo, leg_hi)
+    lo = a + f_lo * (b - a)
+    hi = a + f_hi * (b - a)
+    return lo, hi
+
+
 def chord_segments(cz, table: ShellTable, h_atm_km=0.0, det_depth_km=0.0,
-                   ye_core=YE_CORE_DEFAULT, ye_mantle=YE_MANTLE_DEFAULT):
+                   ye_core=YE_CORE_DEFAULT, ye_mantle=YE_MANTLE_DEFAULT,
+                   segmentation=DEFAULT_SEGMENTATION):
     """Path segments along the neutrino trajectory for ``cos(zenith) = cz``.
 
     Unified geometry covering the full range of ``cz``: up-going through the Earth,
     down-going, and the optional atmospheric production height ``h_atm_km``
     (neutrinos produced at ``R_E + h_atm``, giving a vacuum baseline for
-    down-going / near-horizon directions). PREM shell boundaries are respected
+    down-going / near-horizon directions). PREM region boundaries are respected
     exactly (no density smearing). Returns ``(rho, ye, length_km)`` of fixed length
     ``2 * n_shells + 1`` ordered source -> detector.
+
+    ``segmentation`` chooses how the chord is cut within each PREM region:
+
+    * ``"radial"`` (the v0.2.x default): at every sub-shell boundary of ``table``.  Each
+      sub-shell boundary is a radius the chord can graze, which puts an
+      artificial ``sqrt`` cusp in ``P(cz)`` at every such angle (see
+      :func:`critical_cos_zenith`); pointwise ``dP/dcz`` therefore converges
+      slowly in ``n_sub``.
+    * ``"chord"`` (default): the chord interval of each PREM region is cut into as many
+      equal-length pieces as ``table`` has sub-shells in that region (same
+      segment count and cost).  Piece ends slide smoothly with ``cz``, so the only
+      cusps left are those at the real PREM discontinuities, and ``P`` and
+      ``dP/dcz`` converge as ``1/n_sub^2``.  For a detector at the surface it
+      is identical to ``"radial"`` at the nadir (``cz = -1``), where the two
+      cuts coincide.
 
     Differentiable in ``cz`` *and* in ``ye_core`` / ``ye_mantle`` (the two-zone
     electron fraction, boundary at ``CORE_RADIUS_KM``): these are read here as
@@ -169,6 +260,7 @@ def chord_segments(cz, table: ShellTable, h_atm_km=0.0, det_depth_km=0.0,
     up-going only, an ascending leg spans ``d in [0, |s_det|]``; one vacuum segment
     carries the part above ``R_E``.
     """
+    _check_segmentation(segmentation)
     r_det = R_EARTH_KM - det_depth_km
     r_prod = R_EARTH_KM + h_atm_km
     outer = jnp.asarray(table.outer)
@@ -180,9 +272,6 @@ def chord_segments(cz, table: ShellTable, h_atm_km=0.0, det_depth_km=0.0,
     s_prod = _d(r_prod**2 - rmin2)            # production point (d-coordinate)
     s_det = r_det * cz                        # detector: + down-going, - up-going
     d_low = jnp.where(upgoing, 0.0, s_det)    # bottom of the descending leg
-
-    d_out = _d(outer**2 - rmin2)
-    d_in = _d(inner**2 - rmin2)
     sdet_abs = jnp.abs(s_det)
 
     def ye_at(r):  # two-zone electron fraction (traced in ye_core/ye_mantle)
@@ -191,14 +280,22 @@ def chord_segments(cz, table: ShellTable, h_atm_km=0.0, det_depth_km=0.0,
     # Per-leg clamped d-ranges -> segment lengths and path-midpoint radii.  Sampling
     # density at the *path* midpoint (not the shell's geometric midpoint) makes the
     # constant-per-segment approximation converge far faster in n_sub (NuFast-style).
-    d_hi_desc = jnp.clip(d_out, d_low, s_prod)
-    d_lo_desc = jnp.clip(d_in, d_low, s_prod)
+    if segmentation == "radial":
+        d_out = _d(outer**2 - rmin2)
+        d_in = _d(inner**2 - rmin2)
+        d_hi_desc = jnp.clip(d_out, d_low, s_prod)
+        d_lo_desc = jnp.clip(d_in, d_low, s_prod)
+        d_hi_asc = jnp.clip(d_out, 0.0, sdet_abs)
+        d_lo_asc = jnp.clip(d_in, 0.0, sdet_abs)
+    else:
+        r_a, r_b, f_lo, f_hi = _chord_pieces(table)
+        d_lo_desc, d_hi_desc = _leg_pieces(rmin2, d_low, s_prod, r_a, r_b, f_lo, f_hi)
+        d_lo_asc, d_hi_asc = _leg_pieces(rmin2, 0.0, sdet_abs, r_a, r_b, f_lo, f_hi)
+
     len_desc = d_hi_desc - d_lo_desc
     r_desc = jnp.sqrt(rmin2 + (0.5 * (d_hi_desc + d_lo_desc)) ** 2)
     rho_desc = prem_density_jax(r_desc)
 
-    d_hi_asc = jnp.clip(d_out, 0.0, sdet_abs)
-    d_lo_asc = jnp.clip(d_in, 0.0, sdet_abs)
     len_asc = jnp.where(upgoing, d_hi_asc - d_lo_asc, 0.0)
     r_asc = jnp.sqrt(rmin2 + (0.5 * (d_hi_asc + d_lo_asc)) ** 2)
     rho_asc = prem_density_jax(r_asc)
@@ -215,9 +312,11 @@ def chord_segments(cz, table: ShellTable, h_atm_km=0.0, det_depth_km=0.0,
     return rho_seg, ye_seg, lengths
 
 
-def earth_segments(cz, table: ShellTable, det_depth_km=0.0):
+def earth_segments(cz, table: ShellTable, det_depth_km=0.0,
+                   segmentation=DEFAULT_SEGMENTATION):
     """Earth-only path segments (``h_atm_km = 0``); see :func:`chord_segments`."""
-    return chord_segments(cz, table, h_atm_km=0.0, det_depth_km=det_depth_km)
+    return chord_segments(cz, table, h_atm_km=0.0, det_depth_km=det_depth_km,
+                          segmentation=segmentation)
 
 
 # --- fully parametric, differentiable layered Earth --------------------------
@@ -310,14 +409,23 @@ def baseline_km(cz, det_depth_km=0.0):
 
 
 def critical_cos_zenith(table: ShellTable | None = None, det_depth_km: float = 0.0,
-                        n_sub: int = 4) -> np.ndarray:
+                        n_sub: int = 4,
+                        segmentation: str = DEFAULT_SEGMENTATION) -> np.ndarray:
     """Cos(zenith) values at which the chord grazes a shell boundary.
 
     At these angles the turning-point radius ``r_min(cz)`` exactly equals a
-    shell boundary radius ``r_b``, so the shell the chord is entering
-    contributes a length proportional to ``sqrt(r_b^2 - r_min^2)``: a genuine
-    sqrt-cusp in ``cz`` (inherent piecewise-constant-shell geometry, not a bug
-    to smooth away) where ``dP/dcz`` diverges like ``1/sqrt(|cz - cz_crit|)``.
+    boundary radius ``r_b``, so the layer the chord is entering contributes a
+    length proportional to ``sqrt(r_b^2 - r_min^2)``: a sqrt-cusp in ``cz``
+    where ``dP/dcz`` diverges like ``1/sqrt(|cz - cz_crit|)``.
+
+    Two kinds of boundary produce one.  At a PREM region boundary the density
+    really is discontinuous and continuous PREM has the same cusp (physical).
+    A sub-shell boundary inside a region is an artefact of the
+    ``segmentation="radial"`` discretisation: continuous PREM has no feature
+    there, the cusp shrinks as ``n_sub`` grows but their number grows with it.
+    With ``segmentation="chord"`` (the default; see :func:`chord_segments`) only
+    the PREM region boundaries remain, and that is what is returned; pass
+    ``segmentation="radial"`` for the sub-shell grazing angles as well.
 
     Why you would call this: gradient-based optimizers that move cos(zenith)
     bin edges continuously (e.g. Fisher-optimized binning) should avoid
@@ -326,16 +434,20 @@ def critical_cos_zenith(table: ShellTable | None = None, det_depth_km: float = 0
     well-defined, so a solver can get stuck or take pathological steps.
 
     Returns the sorted, unique cos(zenith) (up-going, ``cz < 0``) for every
-    shell boundary radius ``r_b < r_det = R_EARTH_KM - det_depth_km``, as a
-    plain numpy array -- this is a diagnostic helper, not a differentiable
-    path.  ``table`` defaults to ``shell_table(n_sub)`` (boundary radii do not
-    depend on ``ye_core``/``ye_mantle``).
+    boundary radius ``r_b < r_det = R_EARTH_KM - det_depth_km``, as a plain
+    numpy array -- this is a diagnostic helper, not a differentiable path.
+    ``table`` defaults to ``shell_table(n_sub)`` (boundary radii do not depend
+    on ``ye_core``/``ye_mantle``); it is ignored for ``segmentation="chord"``.
     """
-    if table is None:
-        table = shell_table(n_sub)
+    _check_segmentation(segmentation)
     r_det = R_EARTH_KM - det_depth_km
-    radii = np.unique(np.concatenate(
-        [np.asarray(table.outer), np.asarray(table.inner)]))
+    if segmentation == "chord":
+        radii = np.array([hi for hi, _, _ in _PREM])
+    else:
+        if table is None:
+            table = shell_table(n_sub)
+        radii = np.unique(np.concatenate(
+            [np.asarray(table.outer), np.asarray(table.inner)]))
     radii = radii[(radii > 0.0) & (radii < r_det)]
     return np.sort(-np.sqrt(1.0 - (radii / r_det) ** 2))
 

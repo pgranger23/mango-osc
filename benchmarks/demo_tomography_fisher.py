@@ -95,7 +95,22 @@ _P0 = nufit_no()
 # n_sub=4 matches the shell count used by the original shell_table(4) (43
 # shells), so the per-bin propagation cost is unchanged; only the number of
 # *free parameters* controlling the shell densities changes.
-_BASE_EARTH = _earth.prem_layered(n_sub=4)
+# N_SUB (env var, default 4) is overridden only by the n_sub convergence study
+# in benchmarks/fig_nsub_convergence.py; every paper number uses the default.
+N_SUB = int(os.environ.get("N_SUB", "4"))
+_BASE_EARTH = _earth.prem_layered(n_sub=N_SUB)
+# EARTH_PATH (env var, default "layered") is likewise overridden only by that
+# study.  "layered" is the LayeredEarth above (one constant density per shell;
+# every paper number).  "radial" / "chord" instead take the PREM polynomial
+# path of mango.earth.chord_segments, cut with that segmentation, and apply the
+# same per-zone density scales; the zone edges are PREM region boundaries, so
+# every chord piece lies in one zone.  All three share the n_sub -> infinity
+# limit (PREM with each zone scaled).
+EARTH_PATH = os.environ.get("EARTH_PATH", "layered")
+if EARTH_PATH not in ("layered",) + _earth.SEGMENTATIONS:
+    raise ValueError(f"EARTH_PATH must be 'layered', 'radial' or 'chord', "
+                     f"got {EARTH_PATH!r}")
+_TABLE = _earth.shell_table(N_SUB)
 
 
 def _zone_edges(n_zones):
@@ -181,10 +196,18 @@ def _prob_mumu(e_gev, cz, ln_sc, params, anti, eps=None):
     that epsilon and the shell densities enter the same Hamiltonian term.
     """
     sc = jnp.exp(ln_sc)                          # (N_ZONES,)
-    density = _BASE_EARTH.density * sc[_ZONE_IDX]
-    model = dataclasses.replace(_BASE_EARTH, density=density)
-    rho, ye, L = _earth.layered_chord_segments(model, cz, h_atm_km=H_ATM_KM,
-                                                det_depth_km=0.0)
+    if EARTH_PATH == "layered":
+        density = _BASE_EARTH.density * sc[_ZONE_IDX]
+        model = dataclasses.replace(_BASE_EARTH, density=density)
+        rho, ye, L = _earth.layered_chord_segments(model, cz, h_atm_km=H_ATM_KM,
+                                                    det_depth_km=0.0)
+    else:
+        # segment i of each leg belongs to the PREM region of shell i, hence
+        # to zone _ZONE_IDX[i]; order is atmosphere, descending, ascending
+        rho, ye, L = _earth.chord_segments(cz, _TABLE, h_atm_km=H_ATM_KM,
+                                           segmentation=EARTH_PATH)
+        zsc = sc[_ZONE_IDX]
+        rho = rho * jnp.concatenate([jnp.ones(1), zsc[::-1], zsc])
     v_cc, _ = C.matter_potentials(rho, ye)
     s = _osc.propagate_layers(params.pmns(), params.msquared(),
                               e_gev * C.GEV_TO_EV, v_cc,

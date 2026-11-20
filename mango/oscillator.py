@@ -293,7 +293,8 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
                       n_sub=4, h_atm_km=0.0, ye_core=_earth.YE_CORE_DEFAULT,
                       ye_mantle=_earth.YE_MANTLE_DEFAULT, earth_model=None,
                       anti=False, backend="cayley", nsi=None,
-                      flavor_in=None, flavor_out=None, mass_states=False):
+                      flavor_in=None, flavor_out=None, mass_states=False,
+                      segmentation=None):
     """Oscillation probabilities through the PREM Earth (and atmosphere).
 
     ``energy_GeV`` and ``cos_zenith`` may each be scalar or 1-D.  With both 1-D
@@ -317,6 +318,17 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
     parametric constant-density-shell Earth instead of the fixed PREM polynomials;
     probabilities are then differentiable w.r.t. the **shell boundary radii**,
     **densities** and **Y_e** (it overrides ``n_sub`` / ``ye_core`` / ``ye_mantle``).
+
+    ``segmentation`` (PREM path only) chooses how each PREM region's part of the
+    chord is cut: ``"chord"`` into equal-length pieces, or ``"radial"`` at
+    radial sub-shell boundaries (same segment count and cost).  The default,
+    ``None``, is ``"chord"`` on the PREM path (since v0.3.0; ``"radial"`` before)
+    and the model's own shells with ``earth_model``.  ``"chord"`` has no
+    artificial shell-grazing cusps in ``cos_zenith`` and converges as
+    ``1/n_sub^2`` in both ``P`` and ``dP/dcos_zenith``; the two agree exactly at
+    the nadir for a surface detector.  ``"radial"`` reproduces v0.2.x numbers
+    and the shell cut of OscProb / Prob3++.  See
+    :func:`mango.earth.chord_segments`.
     """
     _check_positive(energy_GeV, "energy_GeV", "GeV, not eV")
     _check_abs_le_one(cos_zenith, "cos_zenith")
@@ -329,11 +341,12 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
     nsi_mat = _nsi_matrix(nsi, na)
     backend = _resolve_backend(params, backend)
 
+    segmentation = _earth.resolve_segmentation(segmentation, earth_model)
     if earth_model is None:
         table = _earth.shell_table(n_sub)  # static boundaries; Y_e traced below
         segments = lambda cz: _earth.chord_segments(
             cz, table, h_atm_km=h_atm_km, det_depth_km=det_depth_km,
-            ye_core=ye_core, ye_mantle=ye_mantle)
+            ye_core=ye_core, ye_mantle=ye_mantle, segmentation=segmentation)
     else:
         segments = lambda cz: _earth.layered_chord_segments(
             earth_model, cz, h_atm_km=h_atm_km, det_depth_km=det_depth_km)

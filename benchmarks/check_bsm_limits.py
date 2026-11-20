@@ -138,3 +138,65 @@ print(f"  central FD at the same point        : {_fd:+.4g}"
       f"   (ratio {_ad/_fd:.1f}x, and finite: isfinite passes)")
 print(f"  AD one part in 1e9 off the crossing : {_off:+.4g}"
       f"   (recovers; the failure is a single point)")
+
+# --- AD vs FD for the decoherence and non-unitarity parameters ----------------
+# Added for the EPJC revision: the paper states that every BSM sensitivity is
+# checked against central finite differences, and before this block only NSI
+# and 3+1 had a row. Each check runs over 12 energies and reports the largest
+# |AD - FD| and that deviation relative to the largest |dP/dx| on the grid.
+from mango import nonunitarity as _nuq
+
+_Eg = jnp.linspace(1.0, 20.0, 12)
+
+
+def _adfd(fun, x0, h):
+    ad = np.asarray(jax.vmap(lambda e: jax.grad(fun)(jnp.asarray(x0), e))(_Eg))
+    fd = np.asarray(jax.vmap(lambda e: (fun(jnp.asarray(x0 + h), e)
+                                        - fun(jnp.asarray(x0 - h), e)) / (2 * h))(_Eg))
+    num = float(np.abs(ad - fd).max())
+    return num, num / float(np.abs(ad).max()), float(np.abs(ad).max())
+
+
+# Lindblad gamma_ij, constant 5.5 g/cm^3 along the Earth diameter (the figure-4(a)
+# configuration), at gamma = 1e-23 GeV; x is gamma in units of 1e-23 GeV.
+_L_DIAM, _G0 = 12742.0, 1e-14                       # km; 1e-23 GeV in eV
+
+
+def _p_lind(key):
+    def fun(x, e):
+        m = dc.Decoherence(**{k: (x if k == key else 1.0) * _G0
+                              for k in ("gamma21", "gamma31", "gamma32")})
+        return dc.probability(p, e, _L_DIAM, m, density=5.5,
+                              flavor_in=Flavor.MU, flavor_out=Flavor.MU)
+    return fun
+
+
+# wave packet: d/d ln(sigma_x) at a sigma_x where the damping is of order one
+_SIG0 = 3e-17                                       # m
+
+
+def _p_wp(t, e):
+    return dc.probability(p, e, _L_DIAM, dc.WavePacket(sigma_x_m=_SIG0 * jnp.exp(t)),
+                          density=5.5, flavor_in=Flavor.MU, flavor_out=Flavor.MU)
+
+
+# non-unitary alpha through the PREM path (cos zenith = -0.8, chord cut)
+def _p_nu(key):
+    def fun(x, e):
+        a = {k: 0.01 for k in ("alpha11", "alpha22", "alpha33")}
+        a["alpha21"] = 0.01 + 0.0j
+        a[key] = x + 0.0j if key == "alpha21" else x
+        return _nuq.probability_earth(p, _nuq.NonUnitarity(**a), e, jnp.asarray(-0.8),
+                                      flavor_in=Flavor.MU, flavor_out=Flavor.MU)
+    return fun
+
+
+print("\nAD vs FD over 12 energies, 1-20 GeV: max|AD-FD|, relative to max|dP|, max|dP|")
+_rows = [(f"Lindblad d/d{k} (x 1e-23 GeV), const.", _p_lind(k), 1.0, 1e-4)
+         for k in ("gamma21", "gamma31", "gamma32")]
+_rows += [("wave packet d/d ln sigma_x, const.", _p_wp, 0.0, 1e-5)]
+_rows += [(f"non-unitary d/d{k}, PREM cz=-0.8", _p_nu(k), 0.01, 1e-6)
+          for k in ("alpha11", "alpha22", "alpha33", "alpha21")]
+for _name, _fun, _x0, _hh in _rows:
+    _a, _r, _s = _adfd(_fun, _x0, _hh)
+    print(f"  {_name:42s} {_a:.1e}  {_r:.1e}  {_s:.3g}")

@@ -241,7 +241,7 @@ def probability_earth(params, nu, energy_GeV, cos_zenith, det_depth_km=0.0,
                       n_sub=4, h_atm_km=0.0, ye_core=_earth.YE_CORE_DEFAULT,
                       ye_mantle=_earth.YE_MANTLE_DEFAULT, earth_model=None,
                       anti=False, backend="cayley", parallel=None,
-                      flavor_in=None, flavor_out=None):
+                      flavor_in=None, flavor_out=None, segmentation=None):
     """Non-unitary oscillation probabilities through the PREM Earth (and
     atmosphere); cf. :func:`mango.oscillator.probability_earth`.
 
@@ -250,18 +250,20 @@ def probability_earth(params, nu, energy_GeV, cos_zenith, det_depth_km=0.0,
     :func:`mango.earth.layered_chord_segments`) for the geometry -- identical to
     the standard front-end -- and chains segments in the mass basis (see the
     module docstring). ``nu`` is a :class:`NonUnitarity`; other parameters match
-    ``oscillator.probability_earth``. ``alpha -> 0`` reproduces the standard
-    layered/PREM probability exactly (the non-cancelling ``N^dag N`` NC term
-    collapses to an overall phase when ``N`` is unitary).
+    ``oscillator.probability_earth`` (including ``segmentation``). ``alpha -> 0``
+    reproduces the standard layered/PREM probability exactly (the
+    non-cancelling ``N^dag N`` NC term collapses to an overall phase when ``N``
+    is unitary).
     """
     u, msq = params.pmns(), params.msquared()
     N, Amat, Bmat = _mass_matter_pieces(nu.N(u), anti)
 
+    segmentation = _earth.resolve_segmentation(segmentation, earth_model)
     if earth_model is None:
         table = _earth.shell_table(n_sub)  # static boundaries; Y_e traced below
         segments = lambda cz: _earth.chord_segments(
             cz, table, h_atm_km=h_atm_km, det_depth_km=det_depth_km,
-            ye_core=ye_core, ye_mantle=ye_mantle)
+            ye_core=ye_core, ye_mantle=ye_mantle, segmentation=segmentation)
     else:
         segments = lambda cz: _earth.layered_chord_segments(
             earth_model, cz, h_atm_km=h_atm_km, det_depth_km=det_depth_km)

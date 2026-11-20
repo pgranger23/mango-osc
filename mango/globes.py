@@ -205,7 +205,9 @@ class GlobesExperiment:
                     "silently zero every appearance channel.")
             L = defs.num(_bl)
             cz = -L / (2.0 * _earth.R_EARTH_KM)
-            rho, ye_seg, seg = _earth.chord_segments(cz, _earth.shell_table(2))
+            # radial cut kept explicitly: unchanged from v0.2.x for imported profiles
+            rho, ye_seg, seg = _earth.chord_segments(cz, _earth.shell_table(2),
+                                                     segmentation="radial")
             keep = np.asarray(seg) > 1e-6
             self.density = np.asarray(rho)[keep]
             self.lengths = np.asarray(seg)[keep]

@@ -162,7 +162,8 @@ mango.probability_constant(params, E, baseline_km=1300.0, density=2.8, ye=0.5)  
 mango.probability_earth(params, E, cz,
                         ye_core=0.466, ye_mantle=0.494,   # configurable two-zone Y_e
                         h_atm_km=15.0,                    # production height -> full cosz
-                        n_sub=4, det_depth_km=0.0)
+                        n_sub=4, det_depth_km=0.0,
+                        segmentation=None)                # chord cut (default); "radial" = v0.2.x
 
 # arbitrary piecewise-constant profile (source -> detector ordering)
 mango.probability_profile(params, E, density_gcc=[...], ye=[...], length_km=[...])
@@ -349,6 +350,18 @@ Four backends, agreeing to ~1e−14:
   geometric midpoint). Together these converge ~3–5× faster in `n_sub`: e.g.
   `n_sub=2` (25 shells) reaches ~3e−3 accuracy, better than naive uniform
   subdivision at 121 shells.
+- **Two ways to cut the chord** (`segmentation=`). `"radial"` (the v0.2.x
+  default) cuts at every sub-shell boundary. Each sub-shell radius is an angle at which the chord
+  grazes it, so `P(cosθ)` gets an artificial √-cusp there: the cusps shrink with
+  `n_sub` but their number grows, and pointwise `∂P/∂cosθ` converges slowly
+  (~`n_sub^-0.7`). `"chord"` cuts each PREM region's part of the chord into the
+  same number of equal-length pieces instead. Piece ends slide smoothly with
+  `cosθ`, so only the cusps at the real PREM discontinuities remain, and `P` and
+  `∂P/∂cosθ` converge as `n_sub^-2` at the same cost (at `n_sub=4`, 2–20 GeV either side of the
+  core threshold, the worst `∂P/∂cosθ` error drops from 14% to 0.05% of its peak).
+  `"chord"` is the default since v0.3.0; `"radial"` stays available to
+  reproduce v0.2.x numbers and the shell cut of OscProb / Prob3++. The two
+  coincide at the nadir for a surface detector. See `benchmarks/fig_nsub_convergence.py`.
 
 ### Layer product (`layers.py`), device-aware
 
